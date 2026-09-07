@@ -1,0 +1,27 @@
+# Dependencies and build output
+node_modules/
+dist/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and test output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# TypeScript and Vite caches
+*.tsbuildinfo
+.vite/
