@@ -18,12 +18,19 @@ with this repository.
 - Player Character creation and editing, including identity, levels, HP, AC,
   abilities, skills, traits, features, inventory, status effects, personality,
   and token art.
-- Environment controls for maps, enemies, NPCs, and objects.
-- Shared GM scene log, narration controls, and common tabletop dice.
+- Library with built-in and custom tokens plus categorized weapons, armor,
+  trinkets, consumables, tools, materials, quest items, trash, and other items.
+- Editable token visuals and per-cell map bounds, with map-token organization
+  and controls in the Environment panel.
+- Shared GM console with full-screen, physics-based 3D dice rolls, calculated
+  totals, character response controls, and clear-history confirmation.
 - Independent AI turns through OpenAI-compatible APIs. Each character receives
   its own sheet and the shared scene history, so it remains aware of the party
   without speaking or acting for another PC.
 - Automatic local campaign persistence.
+- Persisted light/dark themes, curated color palettes, interface density,
+  readable text scales, reduced motion/transparency, enhanced focus, and
+  console preferences.
 
 ## Development
 
@@ -104,8 +111,12 @@ promoted to `main` when it is ready for stable distribution.
 
 ```text
 .
+├── public/
+│   ├── fonts/            Local Voces and Lekton font files and OFL licenses
+│   └── ram-logo.png      RAM application mark
 ├── src/
 │   ├── components/       React interface and canvas components
+│   │   └── ui/           RAM primitives and world glyphs
 │   ├── ai.ts             AI prompt construction and API adapter
 │   ├── store.ts          Persistent campaign state and actions
 │   ├── types.ts          Shared domain models
@@ -129,8 +140,10 @@ browser and are not repository assets.
 - TypeScript
 - Vite
 - Zustand
+- Three.js, React Three Fiber, and Rapier
 - HTML Canvas
 - Lucide icons
+- Voces and Lekton typography (bundled under the SIL Open Font License)
 
 ## Planned direction
 

@@ -1,15 +1,31 @@
-import { Trash2, Upload, X } from "lucide-react";
+import { Copy, Library, Pencil, Trash2, Upload, X } from "lucide-react";
 import { useRef } from "react";
 import { useRAM } from "../store";
+import {
+  ENVIRONMENT_LIGHTING,
+  ENVIRONMENT_LIGHTING_LABELS,
+  tokenDisplayName,
+  type EnvironmentLighting,
+} from "../types";
 import { fileToDataURL } from "../util";
+import {
+  RamIconButton,
+  RamPanel,
+  RamPanelBody,
+  RamPanelHeader,
+  RamSection,
+  RamSelect,
+} from "./ui/RamPrimitives";
 
 export function EnvironmentPanel() {
   const tokens = useRAM((s) => s.tokens);
   const background = useRAM((s) => s.background);
-  const addToken = useRAM((s) => s.addToken);
-  const updateToken = useRAM((s) => s.updateToken);
-  const deleteToken = useRAM((s) => s.deleteToken);
+  const lighting = useRAM((s) => s.lighting);
   const setBackground = useRAM((s) => s.setBackground);
+  const setLighting = useRAM((s) => s.setLighting);
+  const setTokenManagerOpen = useRAM((s) => s.setTokenManagerOpen);
+  const duplicateToken = useRAM((s) => s.duplicateToken);
+  const deleteToken = useRAM((s) => s.deleteToken);
   const bgFileRef = useRef<HTMLInputElement>(null);
 
   const groups = [
@@ -19,13 +35,46 @@ export function EnvironmentPanel() {
   ];
 
   return (
-    <div className="panel env-panel">
-      <div className="panel-header">
-        <span className="panel-title">Environment</span>
-      </div>
-      <div className="panel-body">
-        <div className="env-section">
-          <div className="env-section-title">Map</div>
+    <RamPanel className="env-panel">
+      <RamPanelHeader
+        title="Environment"
+        actions={
+          <RamIconButton label="Open token library" onClick={() => setTokenManagerOpen(true)}>
+            <Library size={17} strokeWidth={1.5} />
+          </RamIconButton>
+        }
+      />
+      <RamPanelBody>
+        <div className="env-scene">
+          <div className="env-scene__row">
+            <RamSelect
+              aria-label="Lighting"
+              value={lighting}
+              onChange={(event) =>
+                setLighting(event.target.value as EnvironmentLighting)
+              }
+            >
+              {ENVIRONMENT_LIGHTING.map((value) => (
+                <option value={value} key={value}>
+                  {ENVIRONMENT_LIGHTING_LABELS[value]}
+                </option>
+              ))}
+            </RamSelect>
+            <span className="section-actions">
+              <RamIconButton label={background ? "Replace map image" : "Upload map image"} onClick={() => bgFileRef.current?.click()}>
+                <Upload size={18} strokeWidth={1.5} />
+              </RamIconButton>
+              {background && (
+                <RamIconButton
+                  label="Remove map"
+                  variant="danger"
+                  onClick={() => setBackground(null)}
+                >
+                  <X size={16} strokeWidth={1.5} />
+                </RamIconButton>
+              )}
+            </span>
+          </div>
           <input
             ref={bgFileRef}
             type="file"
@@ -38,97 +87,98 @@ export function EnvironmentPanel() {
             }}
           />
           {background ? (
-            <>
-              <div className="bg-row">
-                <button className="file-btn" onClick={() => bgFileRef.current?.click()}>
-                  <Upload size={12} style={{ verticalAlign: -2, marginRight: 6 }} />
-                  Replace map image
-                </button>
-                <button
-                  className="icon-btn danger"
-                  title="Remove map"
-                  onClick={() => setBackground(null)}
-                >
-                  <X size={14} />
-                </button>
-              </div>
-              <div className="bg-scale">
-                <span>Scale</span>
-                <input
-                  type="range"
-                  min={0.1}
-                  max={4}
-                  step={0.05}
-                  value={background.scale}
-                  onChange={(e) =>
-                    setBackground({ ...background, scale: Number(e.target.value) })
-                  }
-                />
-                <span>{background.scale.toFixed(2)}×</span>
-              </div>
-            </>
+            <div className="bg-scale">
+              <span className="ram-eyebrow">Map scale</span>
+              <input
+                type="range"
+                min={0.1}
+                max={4}
+                step={0.05}
+                value={background.scale}
+                onChange={(e) =>
+                  setBackground({ ...background, scale: Number(e.target.value) })
+                }
+              />
+              <span>{background.scale.toFixed(2)}×</span>
+            </div>
           ) : (
-            <button className="file-btn" onClick={() => bgFileRef.current?.click()}>
-              <Upload size={12} style={{ verticalAlign: -2, marginRight: 6 }} />
-              Upload map image
-            </button>
+            <span className="empty-inline">No map loaded</span>
           )}
         </div>
 
-        <div className="env-section">
-          <div className="env-section-title">Add to map</div>
-          <div className="env-add-row">
-            <button className="chip-btn" onClick={() => addToken("enemy")}>
-              + Enemy
-            </button>
-            <button className="chip-btn" onClick={() => addToken("npc")}>
-              + NPC
-            </button>
-            <button className="chip-btn" onClick={() => addToken("object")}>
-              + Object
-            </button>
+        <RamSection
+          title="Tokens"
+          action={
+            <RamIconButton label="Browse token library" onClick={() => setTokenManagerOpen(true)}>
+              <Library size={16} strokeWidth={1.5} />
+            </RamIconButton>
+          }
+        >
+          <div className="env-token-tree">
+            {groups.map(({ kind, title }) => {
+              const list = tokens
+                .filter((token) => token.kind === kind)
+                .sort((a, b) => tokenDisplayName(a).localeCompare(tokenDisplayName(b)));
+              return (
+                <section className="env-token-group" key={kind}>
+                  <div className="env-token-group__heading">
+                    <span>{title}</span>
+                    <small>{list.length}</small>
+                  </div>
+                  <div className="token-list">
+                    {list.map((token) => (
+                      <div
+                        className={`token-row token-row--${kind}${
+                          token.givenName.trim() ? " is-named" : ""
+                        }`}
+                        key={token.id}
+                      >
+                        <button
+                          className="token-name"
+                          onClick={() => setTokenManagerOpen(true, kind, "map", token.id)}
+                        >
+                          {tokenDisplayName(token)}
+                        </button>
+                        {token.hp !== undefined && (
+                          <span className="token-hp">
+                            {token.hp}/{token.maxHp}
+                          </span>
+                        )}
+                        <span className="token-row__actions">
+                          <RamIconButton
+                            label={`Edit ${tokenDisplayName(token)}`}
+                            onClick={() => setTokenManagerOpen(true, kind, "map", token.id)}
+                          >
+                            <Pencil size={13} strokeWidth={1.5} />
+                          </RamIconButton>
+                          <RamIconButton
+                            label={`Duplicate ${tokenDisplayName(token)}`}
+                            onClick={() => duplicateToken(token.id)}
+                          >
+                            <Copy size={13} strokeWidth={1.5} />
+                          </RamIconButton>
+                          <RamIconButton
+                            label={`Delete ${tokenDisplayName(token)}`}
+                            variant="danger"
+                            onClick={() => {
+                              if (window.confirm(`Delete ${tokenDisplayName(token)} from the map?`)) {
+                                deleteToken(token.id);
+                              }
+                            }}
+                          >
+                            <Trash2 size={13} strokeWidth={1.5} />
+                          </RamIconButton>
+                        </span>
+                      </div>
+                    ))}
+                    {list.length === 0 && <span className="token-tree-empty">None on map</span>}
+                  </div>
+                </section>
+              );
+            })}
           </div>
-        </div>
-
-        {groups.map(({ kind, title }) => {
-          const list = tokens.filter((t) => t.kind === kind);
-          if (list.length === 0) return null;
-          return (
-            <div className="env-section" key={kind}>
-              <div className="env-section-title">{title}</div>
-              {list.map((t) => (
-                <div className="token-row" key={t.id}>
-                  <span className="pc-dot" style={{ background: t.color }} />
-                  <input
-                    className="token-name"
-                    value={t.name}
-                    spellCheck={false}
-                    onChange={(e) => updateToken(t.id, { name: e.target.value })}
-                  />
-                  {t.kind === "enemy" && (
-                    <input
-                      type="number"
-                      title="HP"
-                      style={{ width: 52, textAlign: "center", flexShrink: 0 }}
-                      value={t.hp ?? 0}
-                      onChange={(e) =>
-                        updateToken(t.id, { hp: Number(e.target.value) || 0 })
-                      }
-                    />
-                  )}
-                  <button
-                    className="icon-btn danger"
-                    onClick={() => deleteToken(t.id)}
-                    title="Remove"
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          );
-        })}
-      </div>
-    </div>
+        </RamSection>
+      </RamPanelBody>
+    </RamPanel>
   );
 }
