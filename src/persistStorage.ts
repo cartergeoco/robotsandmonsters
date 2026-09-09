@@ -1,5 +1,11 @@
 import type { StateStorage } from "zustand/middleware";
-import type { EnvironmentLighting, MapCamera } from "./types";
+import {
+  normalizeLighting,
+  normalizeWeather,
+  type EnvironmentLighting,
+  type EnvironmentWeather,
+  type MapCamera,
+} from "./types";
 
 const DB_NAME = "ram-persist";
 const STORE_NAME = "kv";
@@ -11,6 +17,7 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 
 export type SceneViewSnapshot = {
   lighting: EnvironmentLighting;
+  weather: EnvironmentWeather;
   activeEnvironmentId: string | null;
   mapCamera: MapCamera | null;
   activeView: "grid" | "world-map";
@@ -87,7 +94,8 @@ export function readSceneView(): SceneViewSnapshot | null {
     const parsed = JSON.parse(raw) as Partial<SceneViewSnapshot>;
     if (!parsed || typeof parsed !== "object") return null;
     return {
-      lighting: parsed.lighting ?? "daylight",
+      lighting: normalizeLighting(parsed.lighting),
+      weather: normalizeWeather(parsed.weather),
       activeEnvironmentId: parsed.activeEnvironmentId ?? null,
       mapCamera: parsed.mapCamera ?? null,
       activeView: parsed.activeView === "world-map" ? "world-map" : "grid",
@@ -97,9 +105,22 @@ export function readSceneView(): SceneViewSnapshot | null {
   }
 }
 
-export function writeSceneView(snapshot: SceneViewSnapshot) {
+export function writeSceneView(snapshot: Partial<SceneViewSnapshot>) {
   try {
-    localStorage.setItem(SCENE_VIEW_KEY, JSON.stringify(snapshot));
+    const prev = readSceneView();
+    const next: SceneViewSnapshot = {
+      lighting: normalizeLighting(snapshot.lighting ?? prev?.lighting),
+      weather: normalizeWeather(snapshot.weather ?? prev?.weather),
+      activeEnvironmentId:
+        snapshot.activeEnvironmentId !== undefined
+          ? snapshot.activeEnvironmentId
+          : (prev?.activeEnvironmentId ?? null),
+      mapCamera:
+        snapshot.mapCamera !== undefined ? snapshot.mapCamera : (prev?.mapCamera ?? null),
+      activeView:
+        snapshot.activeView ?? prev?.activeView ?? "grid",
+    };
+    localStorage.setItem(SCENE_VIEW_KEY, JSON.stringify(next));
   } catch {
     // Keep the live session even if the tiny view snapshot cannot be stored.
   }

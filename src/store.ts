@@ -8,9 +8,14 @@ import {
 } from "./persistStorage";
 import type {
   AISettings,
+  AreaPresence,
   CreatureMechanics,
   Environment,
   EnvironmentLighting,
+  EnvironmentTrack,
+  EnvironmentWeather,
+  LightingTransition,
+  WeatherTransition,
   LibraryItem,
   LogEntry,
   MapBackground,
@@ -18,29 +23,58 @@ import type {
   MapToken,
   PC,
   RuleDefinition,
+  SaveArea,
+  SceneTransition,
+  SessionMemory,
   TokenBlueprint,
+  CreatureSheen,
+  CreatureSheenKind,
+  StatusEffect,
+  TokenCell,
+  TokenFloater,
   TokenKind,
   UISettings,
 } from "./types";
 import {
+  CREATURE_SHEEN_MS,
   DEFAULT_ABILITIES,
   DEFAULT_AI_SETTINGS,
+  DEFAULT_SESSION_MEMORY,
   DEFAULT_UI_SETTINGS,
+  DEFAULT_VISUAL_SCALE,
   PC_COLORS,
+  LIGHTING_STEP_MS,
+  SCENE_TRANSITION_MS,
+  TOKEN_FLOATER_MS,
+  creatureFeedbackFloater,
+  emptyDeathSaves,
+  normalizeDeathSaves,
+  lightingCyclePath,
+  normalizeItemRarity,
+  normalizeLighting,
+  normalizeWeather,
   STATUS_EFFECT_PRESETS,
   assignEquipmentSlots,
   calculateCreatureStats,
-  DEFAULT_GRID_OPACITY,
-  DEFAULT_GRID_SIZE,
+  cloneEnvironmentTrack,
+  cloneSaveArea,
+  createSaveArea,
+  defaultStanceForKind,
   inventoryFromKit,
-  normalizeGridOpacity,
-  normalizeGridSize,
+  normalizeUISettings,
+  normalizeSaveArea,
+  normalizeVisualScale,
   rectangularTokenBounds,
   resolvedCreatureProfile,
+  cloneStatBlock,
+  createStatBlock,
+  type StatBlock,
 } from "./types";
 import { PREMADE_LIBRARY_ITEMS } from "./itemCatalog";
 import { PREMADE_RULES } from "./ruleCatalog";
 import { normalizeAISettings } from "./aiProviders";
+import { applyHpChange, creatureUsesDeathSaves } from "./deathSaves";
+import { resolveSceneTriggers } from "./saves";
 
 const uid = () => crypto.randomUUID();
 const LEGACY_PREMADE_ITEM_IDS = [
@@ -67,6 +101,7 @@ const LEGACY_PREMADE_RULE_IDS = [
 
 const cloneLibraryItem = (item: LibraryItem): LibraryItem => ({
   ...item,
+  rarity: normalizeItemRarity(item.rarity),
   properties: [...(item.properties ?? [])],
   actions: [...(item.actions ?? [])],
   contains: [...(item.contains ?? [])],
@@ -90,6 +125,7 @@ const copyMapToken = (token: MapToken, freshIds = false): MapToken => ({
     id: freshIds ? uid() : item.id,
   })),
   wallet: { ...token.wallet },
+  statBlock: token.statBlock ? cloneStatBlock(token.statBlock) : null,
   bounds: token.bounds.map((cell) => ({ ...cell })),
 });
 
@@ -97,9 +133,139 @@ const cloneMapToken = (token: MapToken): MapToken => copyMapToken(token, true);
 
 const cloneEnvironment = (environment: Environment): Environment => ({
   ...environment,
+  lighting: normalizeLighting(environment.lighting),
+  weather: normalizeWeather(environment.weather),
   background: environment.background ? { ...environment.background } : null,
+  music: cloneEnvironmentTrack(environment.music),
+  ambience: cloneEnvironmentTrack(environment.ambience),
   tokens: environment.tokens.map(cloneMapToken),
+  saveAreas: (environment.saveAreas ?? []).map(cloneSaveArea),
 });
+
+function omitLegacyDiceLook(
+  ui: (Partial<UISettings> & { diceLook?: unknown; theme?: string }) | undefined
+): Partial<UISettings> & { theme?: string; palette?: string } {
+  if (!ui) return {};
+  const { diceLook: _removed, ...rest } = ui;
+  return rest;
+}
+
+function withTokenLogistics<T extends MapToken | TokenBlueprint>(value: T): T {
+  return {
+    ...value,
+    stance: value.stance ?? defaultStanceForKind(value.kind),
+    visualScale: normalizeVisualScale(value.visualScale ?? DEFAULT_VISUAL_SCALE),
+    ...("hidden" in value
+      ? {
+          hidden: Boolean(value.hidden),
+          stealthTotal:
+            typeof value.stealthTotal === "number" ? value.stealthTotal : null,
+        }
+      : {}),
+  };
+}
+
+function withPcLogistics(pc: PC): PC {
+  return {
+    ...pc,
+    visualScale: normalizeVisualScale(pc.visualScale ?? DEFAULT_VISUAL_SCALE),
+    hidden: Boolean(pc.hidden),
+    stealthTotal: typeof pc.stealthTotal === "number" ? pc.stealthTotal : null,
+  };
+}
+
+function pruneCreatureSheens(sheens: CreatureSheen[], now = Date.now()): CreatureSheen[] {
+  return sheens.filter((sheen) => now - sheen.bornAt < CREATURE_SHEEN_MS);
+}
+
+function appendCreatureSheens(
+  sheens: CreatureSheen[],
+  added: Array<{ creatureId: string; kind: CreatureSheenKind }>,
+  now = Date.now()
+): CreatureSheen[] {
+  const next = pruneCreatureSheens(sheens, now);
+  for (const entry of added) {
+    next.push({ id: uid(), creatureId: entry.creatureId, kind: entry.kind, bornAt: now });
+  }
+  return next;
+}
+
+function appendTokenFloaters(
+  floaters: TokenFloater[],
+  added: Array<Omit<TokenFloater, "id" | "bornAt">>,
+  now = Date.now()
+): TokenFloater[] {
+  const next = floaters.filter((entry) => now - entry.bornAt < TOKEN_FLOATER_MS);
+  for (const entry of added) {
+    next.push({ ...entry, id: uid(), bornAt: now });
+  }
+  return next;
+}
+
+function statusFeedbackFromPatch(
+  creatureId: string,
+  previous: StatusEffect[] | undefined,
+  next: StatusEffect[] | undefined,
+  patch: { statuses?: StatusEffect[]; hp?: number }
+): {
+  sheens: Array<{ creatureId: string; kind: CreatureSheenKind }>;
+  floaters: Array<Omit<TokenFloater, "id" | "bornAt">>;
+} {
+  if (!patch.statuses || patch.hp !== undefined) {
+    return { sheens: [], floaters: [] };
+  }
+  const priorIds = new Set((previous ?? []).map((status) => status.id));
+  const added = (next ?? []).filter(
+    (status) =>
+      !priorIds.has(status.id) && (status.kind === "buff" || status.kind === "debuff")
+  );
+  const latest = added[added.length - 1];
+  if (!latest) return { sheens: [], floaters: [] };
+  return {
+    sheens: [{ creatureId, kind: latest.kind }],
+    floaters: added.map((status) =>
+      creatureFeedbackFloater(creatureId, status.kind, status.name.toUpperCase())
+    ),
+  };
+}
+
+function reducedMotion(motion: UISettings["motion"]): boolean {
+  if (motion === "reduced") return true;
+  if (motion === "system" && typeof window !== "undefined") {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+  return false;
+}
+
+function sceneDurationMs(motion: UISettings["motion"]): number {
+  return reducedMotion(motion) ? 80 : SCENE_TRANSITION_MS;
+}
+
+function lightingDurationMs(
+  motion: UISettings["motion"],
+  pathLength: number
+): number {
+  if (reducedMotion(motion)) return 80;
+  return Math.max(80, LIGHTING_STEP_MS * Math.max(1, pathLength - 1));
+}
+
+function displayedLighting(
+  lighting: EnvironmentLighting,
+  transition: LightingTransition | null,
+  now = Date.now()
+): EnvironmentLighting {
+  if (!transition?.path.length) return lighting;
+  const progress = Math.max(
+    0,
+    Math.min(1, (now - transition.startedAt) / Math.max(1, transition.durationMs))
+  );
+  const segments = Math.max(1, transition.path.length - 1);
+  const index = Math.min(
+    transition.path.length - 1,
+    Math.round(progress * segments)
+  );
+  return transition.path[index] ?? lighting;
+}
 
 const cloneRule = (rule: RuleDefinition): RuleDefinition => ({
   ...rule,
@@ -129,7 +295,7 @@ function withCalculatedStats<T extends CreatureMechanics>(
   rules: RuleDefinition[],
   items: LibraryItem[]
 ): T {
-  if ("kind" in value && value.kind === "object") return value;
+  if ("kind" in value && value.kind === "object" && !value.statBlock) return value;
   const calculated = calculateCreatureStats(value, rules, items);
   const profile = resolvedCreatureProfile(value, rules);
   return {
@@ -137,7 +303,33 @@ function withCalculatedStats<T extends CreatureMechanics>(
     ...profile,
     maxHp: calculated.maxHp,
     ac: calculated.armorClass,
+    deathSaves: normalizeDeathSaves(value.deathSaves),
   };
+}
+
+function applyCreaturePatch<T extends CreatureMechanics>(
+  current: T,
+  patch: Partial<T>,
+  rules: RuleDefinition[],
+  items: LibraryItem[]
+): T {
+  const merged = withCalculatedStats(
+    { ...current, ...patch },
+    rules,
+    items
+  );
+  if (patch.hp === undefined || patch.deathSaves !== undefined) return merged;
+  if (patch.hp === current.hp) return merged;
+  return applyHpChange(
+    {
+      ...merged,
+      hp: current.hp,
+      deathSaves: current.deathSaves,
+      statuses: current.statuses,
+    },
+    patch.hp - current.hp,
+    { usesDeathSaves: creatureUsesDeathSaves(current) }
+  ).creature;
 }
 
 const COLORFREE_MIGRATION: Record<string, string> = {
@@ -162,22 +354,37 @@ interface RAMState {
   customLibraryItems: LibraryItem[];
   ruleDefinitions: RuleDefinition[];
   environments: Environment[];
+  saveAreas: SaveArea[];
+  areaPresence: AreaPresence[];
+  tokenFloaters: TokenFloater[];
+  creatureSheens: CreatureSheen[];
+  selectedSaveAreaId: string | null;
   deletedLibraryItemIds: string[];
   deletedRuleDefinitionIds: string[];
   background: MapBackground | null;
   lighting: EnvironmentLighting;
+  weather: EnvironmentWeather;
+  music: EnvironmentTrack | null;
+  ambience: EnvironmentTrack | null;
   activeEnvironmentId: string | null;
   mapCamera: MapCamera | null;
+  sceneTransition: SceneTransition | null;
+  lightingTransition: LightingTransition | null;
+  weatherTransition: WeatherTransition | null;
   log: LogEntry[];
+  /** Digest of console history that scrolled out of the verbatim window. */
+  memory: SessionMemory;
   settings: AISettings;
   uiSettings: UISettings;
   /** PC ids with an in-flight AI request. */
   thinking: string[];
+  /** True while the session digest is being regenerated. */
+  memoryBusy: boolean;
   selectedPcId: string | null;
   settingsOpen: boolean;
   tokenManagerOpen: boolean;
   tokenManagerKind: TokenKind | "all";
-  tokenManagerTab: "library" | "map";
+  tokenManagerTab: "library" | "map" | "environments";
   tokenManagerTokenId: string | null;
   activeView: "grid" | "world-map";
 
@@ -188,9 +395,11 @@ interface RAMState {
   updatePC: (id: string, patch: Partial<PC>) => void;
   deletePC: (id: string) => void;
   selectPC: (id: string | null) => void;
+  moveCreature: (id: string, isPC: boolean, x: number, y: number) => void;
 
   placeToken: (blueprint: TokenBlueprint) => void;
   updateToken: (id: string, patch: Partial<MapToken>) => void;
+  addTokenFloater: (floater: Omit<TokenFloater, "id" | "bornAt">) => void;
   duplicateToken: (id: string) => void;
   deleteToken: (id: string) => void;
   addTokenBlueprint: (blueprint: TokenBlueprint) => void;
@@ -207,12 +416,24 @@ interface RAMState {
   deleteEnvironment: (id: string) => void;
   applyEnvironment: (id: string) => void;
   captureEnvironment: (id: string) => void;
+  addSaveArea: (cells?: TokenCell[]) => string;
+  updateSaveArea: (id: string, patch: Partial<SaveArea>) => void;
+  deleteSaveArea: (id: string) => void;
+  selectSaveArea: (id: string | null) => void;
+  setSaveAreaCell: (id: string, x: number, y: number, occupied: boolean) => void;
+  flushSceneTriggers: () => void;
   setLighting: (lighting: EnvironmentLighting) => void;
+  setWeather: (weather: EnvironmentWeather) => void;
+  setMusic: (music: EnvironmentTrack | null) => void;
+  setAmbience: (ambience: EnvironmentTrack | null) => void;
   setMapCamera: (camera: MapCamera) => void;
+  clearSceneTransition: () => void;
+  clearLightingTransition: () => void;
+  clearWeatherTransition: () => void;
   setTokenManagerOpen: (
     open: boolean,
     kind?: TokenKind | "all",
-    tab?: "library" | "map",
+    tab?: "library" | "map" | "environments",
     tokenId?: string | null
   ) => void;
 
@@ -220,6 +441,11 @@ interface RAMState {
 
   addLog: (entry: Omit<LogEntry, "id" | "ts">) => void;
   clearLog: () => void;
+
+  setMemory: (memory: SessionMemory) => void;
+  setMemoryBullets: (bullets: string[]) => void;
+  setMemoryBusy: (busy: boolean) => void;
+  clearMemory: () => void;
 
   setSettings: (patch: Partial<AISettings>) => void;
   setUISettings: (patch: Partial<UISettings>) => void;
@@ -237,14 +463,20 @@ type PersistedRAMState = Pick<
   | "customLibraryItems"
   | "ruleDefinitions"
   | "environments"
+  | "saveAreas"
+  | "areaPresence"
   | "deletedLibraryItemIds"
   | "deletedRuleDefinitionIds"
   | "background"
   | "lighting"
+  | "weather"
+  | "music"
+  | "ambience"
   | "activeEnvironmentId"
   | "mapCamera"
   | "activeView"
   | "log"
+  | "memory"
   | "settings"
   | "uiSettings"
 >;
@@ -253,6 +485,7 @@ type LegacyPersistedRAMState = Omit<
   PersistedRAMState,
   | "settings"
   | "uiSettings"
+  | "memory"
   | "customTokenBlueprints"
   | "customLibraryItems"
   | "ruleDefinitions"
@@ -260,19 +493,26 @@ type LegacyPersistedRAMState = Omit<
   | "deletedLibraryItemIds"
   | "deletedRuleDefinitionIds"
   | "lighting"
+  | "weather"
   | "activeEnvironmentId"
   | "mapCamera"
   | "activeView"
 > & {
   settings: Partial<AISettings>;
   uiSettings?: Partial<UISettings>;
+  memory?: Partial<SessionMemory>;
   customTokenBlueprints?: TokenBlueprint[];
   customLibraryItems?: LibraryItem[];
   ruleDefinitions?: RuleDefinition[];
   environments?: Environment[];
+  saveAreas?: SaveArea[];
+  areaPresence?: AreaPresence[];
   deletedLibraryItemIds?: string[];
   deletedRuleDefinitionIds?: string[];
   lighting?: EnvironmentLighting;
+  weather?: EnvironmentWeather;
+  music?: EnvironmentTrack | null;
+  ambience?: EnvironmentTrack | null;
   activeEnvironmentId?: string | null;
   mapCamera?: MapCamera | null;
   activeView?: "grid" | "world-map";
@@ -285,9 +525,42 @@ export const useRAM = create<RAMState>()(
         const state = get();
         writeSceneView({
           lighting: state.lighting,
+          weather: state.weather,
           activeEnvironmentId: state.activeEnvironmentId,
           mapCamera: state.mapCamera,
           activeView: state.activeView,
+        });
+      };
+
+      const applySceneTriggers = () => {
+        const state = get();
+        const result = resolveSceneTriggers({
+          pcs: state.pcs,
+          tokens: state.tokens,
+          saveAreas: state.saveAreas,
+          areaPresence: state.areaPresence,
+          tokenFloaters: state.tokenFloaters,
+          rules: state.ruleDefinitions,
+          items: state.customLibraryItems,
+          perceptionRadius: state.settings.perceptionRadius,
+        });
+        if (!result.changed) return;
+        set({
+          pcs: result.pcs,
+          tokens: result.tokens,
+          areaPresence: result.areaPresence,
+          tokenFloaters: result.tokenFloaters,
+          creatureSheens: appendCreatureSheens(state.creatureSheens, result.statusSheens),
+          log: result.logs.length
+            ? [
+                ...state.log,
+                ...result.logs.map((entry) => ({
+                  ...entry,
+                  id: uid(),
+                  ts: Date.now(),
+                })),
+              ]
+            : state.log,
         });
       };
 
@@ -299,12 +572,23 @@ export const useRAM = create<RAMState>()(
       customLibraryItems: PREMADE_LIBRARY_ITEMS.map(cloneLibraryItem),
       ruleDefinitions: PREMADE_RULES.map(cloneRule),
       environments: [],
+      saveAreas: [],
+      areaPresence: [],
+      tokenFloaters: [],
+      creatureSheens: [],
+      selectedSaveAreaId: null,
       deletedLibraryItemIds: [],
       deletedRuleDefinitionIds: [],
       background: null,
-      lighting: "daylight",
+      lighting: "noon",
+      weather: "clear",
+      music: null,
+      ambience: null,
       activeEnvironmentId: null,
       mapCamera: null,
+      sceneTransition: null,
+      lightingTransition: null,
+      weatherTransition: null,
       log: [
         {
           id: uid(),
@@ -314,9 +598,11 @@ export const useRAM = create<RAMState>()(
           text: "Welcome, Game Master. Create a character, set the scene, and begin.",
         },
       ],
+      memory: { ...DEFAULT_SESSION_MEMORY, bullets: [] },
       settings: { ...DEFAULT_AI_SETTINGS },
       uiSettings: { ...DEFAULT_UI_SETTINGS },
       thinking: [],
+      memoryBusy: false,
       selectedPcId: null,
       settingsOpen: false,
       tokenManagerOpen: false,
@@ -361,10 +647,17 @@ export const useRAM = create<RAMState>()(
             inventory: fighter ? inventoryFromKit(fighter.startingKit, items) : [],
             wallet: { copper: 0, silver: 0, gold: 0 },
             statuses: [],
+            // Player characters are built from race and class, not a stat block.
+            statBlock: null,
             alignment: "True Neutral",
             personality:
               "Brave but cautious. Speaks plainly and acts decisively when the party hesitates.",
+            knowledge: "",
             color: PC_COLORS[n % PC_COLORS.length],
+            visualScale: DEFAULT_VISUAL_SCALE,
+            hidden: false,
+            stealthTotal: null,
+            deathSaves: emptyDeathSaves(),
             width: 1,
             height: 1,
             bounds: rectangularTokenBounds(1, 1),
@@ -375,6 +668,7 @@ export const useRAM = create<RAMState>()(
           items
         );
         set({ pcs: [...get().pcs, { ...pc, hp: pc.maxHp }], selectedPcId: id });
+        applySceneTriggers();
         return id;
       },
 
@@ -397,41 +691,89 @@ export const useRAM = create<RAMState>()(
           statuses: source.statuses.map((status) => ({ ...status, id: uid() })),
           inventory: source.inventory.map((item) => ({ ...item, id: uid() })),
           wallet: { ...source.wallet },
+          statBlock: source.statBlock ? cloneStatBlock(source.statBlock) : null,
           bounds: source.bounds.map((cell) => ({ ...cell })),
         };
         set({ pcs: [...get().pcs, copy], selectedPcId: copy.id });
+        applySceneTriggers();
       },
 
-      levelUpParty: () =>
+      levelUpParty: () => {
+        const state = get();
+        if (state.pcs.length === 0) return;
+        const nextPcs = state.pcs.map((pc) => {
+          const next = withCalculatedStats(
+            { ...pc, level: pc.level + 1 },
+            state.ruleDefinitions,
+            state.customLibraryItems
+          );
+          const gainedHp = Math.max(0, next.maxHp - pc.maxHp);
+          return { ...next, hp: Math.min(next.maxHp, pc.hp + gainedHp) };
+        });
         set({
-          pcs: get().pcs.map((pc) => {
-            const next = withCalculatedStats(
-              { ...pc, level: pc.level + 1 },
-              get().ruleDefinitions,
-              get().customLibraryItems
-            );
-            const gainedHp = Math.max(0, next.maxHp - pc.maxHp);
-            return { ...next, hp: Math.min(next.maxHp, pc.hp + gainedHp) };
-          }),
-        }),
-
-      updatePC: (id, patch) =>
-        set({
-          pcs: get().pcs.map((p) =>
-            p.id === id
-              ? withCalculatedStats(
-                  { ...p, ...patch },
-                  get().ruleDefinitions,
-                  get().customLibraryItems
-                )
-              : p
+          pcs: nextPcs,
+          creatureSheens: appendCreatureSheens(
+            state.creatureSheens,
+            nextPcs.map((pc) => ({ creatureId: pc.id, kind: "levelup" as const }))
           ),
-        }),
+          tokenFloaters: appendTokenFloaters(
+            state.tokenFloaters,
+            nextPcs.map((pc) =>
+              creatureFeedbackFloater(pc.id, "levelup", "LEVEL UP", `Lv ${pc.level}`)
+            )
+          ),
+        });
+      },
+
+      updatePC: (id, patch) => {
+        const state = get();
+        const current = state.pcs.find((pc) => pc.id === id);
+        if (!current) return;
+        const next = applyCreaturePatch(
+          current,
+          patch,
+          state.ruleDefinitions,
+          state.customLibraryItems
+        );
+        const feedback = statusFeedbackFromPatch(id, current.statuses, next.statuses, patch);
+        set({
+          pcs: state.pcs.map((pc) => (pc.id === id ? next : pc)),
+          ...(feedback.sheens.length
+            ? { creatureSheens: appendCreatureSheens(state.creatureSheens, feedback.sheens) }
+            : {}),
+          ...(feedback.floaters.length
+            ? { tokenFloaters: appendTokenFloaters(state.tokenFloaters, feedback.floaters) }
+            : {}),
+        });
+        applySceneTriggers();
+      },
+
+      moveCreature: (id, isPC, x, y) => {
+        if (isPC) {
+          const pc = get().pcs.find((entry) => entry.id === id);
+          if (!pc || (pc.x === x && pc.y === y)) return;
+          set({
+            pcs: get().pcs.map((entry) => (entry.id === id ? { ...entry, x, y } : entry)),
+          });
+        } else {
+          const token = get().tokens.find((entry) => entry.id === id);
+          if (!token || (token.x === x && token.y === y)) return;
+          set({
+            tokens: get().tokens.map((entry) =>
+              entry.id === id ? { ...entry, x, y } : entry
+            ),
+          });
+        }
+        applySceneTriggers();
+      },
 
       deletePC: (id) =>
         set({
           pcs: get().pcs.filter((p) => p.id !== id),
           selectedPcId: get().selectedPcId === id ? null : get().selectedPcId,
+          areaPresence: get().areaPresence.filter((entry) => entry.creatureId !== id),
+          tokenFloaters: get().tokenFloaters.filter((entry) => entry.creatureId !== id),
+          creatureSheens: get().creatureSheens.filter((entry) => entry.creatureId !== id),
         }),
 
       selectPC: (id) => set({ selectedPcId: id }),
@@ -445,6 +787,13 @@ export const useRAM = create<RAMState>()(
           id: uid(),
           blueprintId: blueprint.id,
           givenName: "",
+          stance: blueprint.stance ?? defaultStanceForKind(kind),
+          visualScale: normalizeVisualScale(
+            blueprint.visualScale ?? DEFAULT_VISUAL_SCALE
+          ),
+          hidden: false,
+          stealthTotal: null,
+          deathSaves: emptyDeathSaves(),
           hp: blueprint.maxHp,
           skills: blueprint.skills.map((skill) => ({ ...skill, id: uid() })),
           traits: blueprint.traits.map((trait) => ({ ...trait, id: uid() })),
@@ -455,6 +804,7 @@ export const useRAM = create<RAMState>()(
           ),
           inventory: blueprint.inventory.map((item) => ({ ...item, id: uid() })),
           wallet: { ...blueprint.wallet },
+          statBlock: blueprint.statBlock ? cloneStatBlock(blueprint.statBlock) : null,
           bounds:
             blueprint.bounds?.length > 0
               ? blueprint.bounds.map((cell) => ({ ...cell }))
@@ -464,20 +814,37 @@ export const useRAM = create<RAMState>()(
         };
         void _source;
         set({ tokens: [...get().tokens, token] });
+        applySceneTriggers();
       },
 
-      updateToken: (id, patch) =>
+      updateToken: (id, patch) => {
+        const state = get();
+        const current = state.tokens.find((token) => token.id === id);
+        if (!current) return;
+        const next = applyCreaturePatch(
+          current,
+          patch,
+          state.ruleDefinitions,
+          state.customLibraryItems
+        );
+        const feedback = statusFeedbackFromPatch(id, current.statuses, next.statuses, patch);
         set({
-          tokens: get().tokens.map((t) =>
-            t.id === id
-              ? withCalculatedStats(
-                  { ...t, ...patch },
-                  get().ruleDefinitions,
-                  get().customLibraryItems
-                )
-              : t
-          ),
-        }),
+          tokens: state.tokens.map((token) => (token.id === id ? next : token)),
+          ...(feedback.sheens.length
+            ? { creatureSheens: appendCreatureSheens(state.creatureSheens, feedback.sheens) }
+            : {}),
+          ...(feedback.floaters.length
+            ? { tokenFloaters: appendTokenFloaters(state.tokenFloaters, feedback.floaters) }
+            : {}),
+        });
+        applySceneTriggers();
+      },
+
+      addTokenFloater: (floater) => {
+        set({
+          tokenFloaters: appendTokenFloaters(get().tokenFloaters, [floater]),
+        });
+      },
 
       duplicateToken: (id) => {
         const source = get().tokens.find((token) => token.id === id);
@@ -498,12 +865,19 @@ export const useRAM = create<RAMState>()(
           ),
           inventory: source.inventory.map((item) => ({ ...item, id: uid() })),
           wallet: { ...source.wallet },
+          statBlock: source.statBlock ? cloneStatBlock(source.statBlock) : null,
         };
         set({ tokens: [...get().tokens, copy] });
+        applySceneTriggers();
       },
 
       deleteToken: (id) =>
-        set({ tokens: get().tokens.filter((t) => t.id !== id) }),
+        set({
+          tokens: get().tokens.filter((t) => t.id !== id),
+          areaPresence: get().areaPresence.filter((entry) => entry.creatureId !== id),
+          tokenFloaters: get().tokenFloaters.filter((entry) => entry.creatureId !== id),
+          creatureSheens: get().creatureSheens.filter((entry) => entry.creatureId !== id),
+        }),
 
       addTokenBlueprint: (blueprint) =>
         set({ customTokenBlueprints: [...get().customTokenBlueprints, blueprint] }),
@@ -618,6 +992,9 @@ export const useRAM = create<RAMState>()(
                   tokens: patch.tokens
                     ? patch.tokens.map((token) => copyMapToken(token))
                     : environment.tokens,
+                  saveAreas: patch.saveAreas
+                    ? patch.saveAreas.map(cloneSaveArea)
+                    : (environment.saveAreas ?? []).map(cloneSaveArea),
                 }
               : environment
           ),
@@ -635,13 +1012,78 @@ export const useRAM = create<RAMState>()(
       applyEnvironment: (id) => {
         const environment = get().environments.find((entry) => entry.id === id);
         if (!environment) return;
+        const current = get();
+        const durationMs = sceneDurationMs(current.uiSettings.motion);
+        const startedAt = Date.now();
+        const nextLighting = normalizeLighting(environment.lighting);
+        const nextWeather = normalizeWeather(environment.weather);
+        const lightingPath = lightingCyclePath(
+          displayedLighting(current.lighting, current.lightingTransition),
+          nextLighting
+        );
+        const lightingMs = lightingDurationMs(
+          current.uiSettings.motion,
+          lightingPath.length
+        );
+        const weatherChanged = nextWeather !== current.weather;
+        const weatherMs = reducedMotion(current.uiSettings.motion) ? 80 : 1200;
         set({
+          sceneTransition: {
+            startedAt,
+            durationMs,
+            fromLighting: current.lighting,
+            fromBackground: current.background
+              ? { ...current.background }
+              : null,
+            fromTokens: current.tokens.map((token) => copyMapToken(token)),
+          },
+          lightingTransition:
+            lightingPath.length > 1
+              ? { startedAt, durationMs: lightingMs, path: lightingPath }
+              : null,
+          weatherTransition: weatherChanged
+            ? {
+                startedAt,
+                durationMs: weatherMs,
+                fromWeather: current.weather,
+              }
+            : null,
           activeEnvironmentId: id,
-          lighting: environment.lighting,
-          background: environment.background ? { ...environment.background } : null,
+          lighting: nextLighting,
+          weather: nextWeather,
+          background: environment.background
+            ? { ...environment.background }
+            : null,
+          music: cloneEnvironmentTrack(environment.music),
+          ambience: cloneEnvironmentTrack(environment.ambience),
           tokens: environment.tokens.map(cloneMapToken),
+          saveAreas: (environment.saveAreas ?? []).map(cloneSaveArea),
+          areaPresence: [],
+          tokenFloaters: [],
+          creatureSheens: [],
+          selectedSaveAreaId: null,
         });
         snapshotScene();
+        applySceneTriggers();
+        window.setTimeout(() => {
+          if (get().sceneTransition?.startedAt === startedAt) {
+            set({ sceneTransition: null });
+          }
+        }, durationMs + 80);
+        if (lightingPath.length > 1) {
+          window.setTimeout(() => {
+            if (get().lightingTransition?.startedAt === startedAt) {
+              set({ lightingTransition: null });
+            }
+          }, lightingMs + 80);
+        }
+        if (weatherChanged) {
+          window.setTimeout(() => {
+            if (get().weatherTransition?.startedAt === startedAt) {
+              set({ weatherTransition: null });
+            }
+          }, weatherMs + 80);
+        }
       },
 
       captureEnvironment: (id) => {
@@ -653,8 +1095,12 @@ export const useRAM = create<RAMState>()(
               ? {
                   ...entry,
                   lighting: get().lighting,
+                  weather: get().weather,
                   background: get().background ? { ...get().background! } : null,
+                  music: cloneEnvironmentTrack(get().music),
+                  ambience: cloneEnvironmentTrack(get().ambience),
                   tokens: get().tokens.map(cloneMapToken),
+                  saveAreas: get().saveAreas.map(cloneSaveArea),
                 }
               : entry
           ),
@@ -664,13 +1110,131 @@ export const useRAM = create<RAMState>()(
       },
 
       setLighting: (lighting) => {
-        set({ lighting });
+        const current = get();
+        const next = normalizeLighting(lighting);
+        const from = displayedLighting(
+          current.lighting,
+          current.lightingTransition
+        );
+        if (next === current.lighting && !current.lightingTransition) return;
+        const path = lightingCyclePath(from, next);
+        const startedAt = Date.now();
+        const durationMs = lightingDurationMs(
+          current.uiSettings.motion,
+          path.length
+        );
+        set({
+          lighting: next,
+          lightingTransition:
+            path.length > 1
+              ? { startedAt, durationMs, path }
+              : null,
+        });
         snapshotScene();
+        if (path.length > 1) {
+          window.setTimeout(() => {
+            if (get().lightingTransition?.startedAt === startedAt) {
+              set({ lightingTransition: null });
+            }
+          }, durationMs + 80);
+        }
       },
 
-      setMapCamera: (mapCamera) => {
-        set({ mapCamera });
+      setWeather: (weather) => {
+        const current = get();
+        const next = normalizeWeather(weather);
+        if (next === current.weather && !current.weatherTransition) return;
+        const startedAt = Date.now();
+        const durationMs = reducedMotion(current.uiSettings.motion) ? 80 : 1200;
+        set({
+          weather: next,
+          weatherTransition:
+            next === current.weather
+              ? null
+              : { startedAt, durationMs, fromWeather: current.weather },
+        });
         snapshotScene();
+        if (next !== current.weather) {
+          window.setTimeout(() => {
+            if (get().weatherTransition?.startedAt === startedAt) {
+              set({ weatherTransition: null });
+            }
+          }, durationMs + 80);
+        }
+      },
+
+      setMusic: (music) => set({ music: cloneEnvironmentTrack(music) }),
+
+      setAmbience: (ambience) =>
+        set({ ambience: cloneEnvironmentTrack(ambience) }),
+
+      addSaveArea: (cells) => {
+        const origin = get().pcs[0];
+        const ox = origin?.x ?? 0;
+        const oy = origin?.y ?? 0;
+        const fallback: TokenCell[] = [
+          { x: ox, y: oy },
+          { x: ox + 1, y: oy },
+          { x: ox, y: oy + 1 },
+          { x: ox + 1, y: oy + 1 },
+        ];
+        const area = createSaveArea(
+          cells?.length ? cells : fallback,
+          get().saveAreas.length
+        );
+        set({
+          saveAreas: [...get().saveAreas, area],
+          selectedSaveAreaId: area.id,
+        });
+        applySceneTriggers();
+        return area.id;
+      },
+
+      updateSaveArea: (id, patch) => {
+        set({
+          saveAreas: get().saveAreas.map((area) =>
+            area.id === id ? normalizeSaveArea({ ...area, ...patch }) : area
+          ),
+        });
+        applySceneTriggers();
+      },
+
+      deleteSaveArea: (id) =>
+        set({
+          saveAreas: get().saveAreas.filter((area) => area.id !== id),
+          areaPresence: get().areaPresence.filter((entry) => entry.areaId !== id),
+          selectedSaveAreaId:
+            get().selectedSaveAreaId === id ? null : get().selectedSaveAreaId,
+        }),
+
+      selectSaveArea: (id) => set({ selectedSaveAreaId: id }),
+
+      setSaveAreaCell: (id, x, y, occupied) => {
+        const area = get().saveAreas.find((entry) => entry.id === id);
+        if (!area) return;
+        const has = area.cells.some((cell) => cell.x === x && cell.y === y);
+        if (has === occupied) return;
+        const cells = occupied
+          ? [...area.cells, { x, y }]
+          : area.cells.filter((cell) => !(cell.x === x && cell.y === y));
+        if (!cells.length) return;
+        set({
+          saveAreas: get().saveAreas.map((entry) =>
+            entry.id === id ? { ...entry, cells } : entry
+          ),
+        });
+        applySceneTriggers();
+      },
+
+      flushSceneTriggers: () => applySceneTriggers(),
+
+      clearSceneTransition: () => set({ sceneTransition: null }),
+      clearLightingTransition: () => set({ lightingTransition: null }),
+      clearWeatherTransition: () => set({ weatherTransition: null }),
+
+      setMapCamera: (mapCamera) => {
+        get().mapCamera = mapCamera;
+        writeSceneView({ mapCamera });
       },
 
       deleteRuleDefinition: (id) => {
@@ -716,19 +1280,33 @@ export const useRAM = create<RAMState>()(
           log: [...get().log, { ...entry, id: uid(), ts: Date.now() }],
         }),
 
-      clearLog: () => set({ log: [] }),
+      clearLog: () =>
+        set({ log: [], memory: { ...DEFAULT_SESSION_MEMORY, bullets: [] } }),
 
-      setSettings: (patch) =>
-        set({ settings: normalizeAISettings({ ...get().settings, ...patch }) }),
+      setMemory: (memory) => set({ memory }),
+
+      setMemoryBullets: (bullets) =>
+        set({
+          memory: {
+            ...get().memory,
+            bullets: bullets.map((bullet) => bullet.trim()).filter(Boolean),
+            updatedAt: Date.now(),
+          },
+        }),
+
+      setMemoryBusy: (memoryBusy) => set({ memoryBusy }),
+
+      /** Forgets the digest but keeps the log, so the next pass rebuilds it. */
+      clearMemory: () => set({ memory: { ...DEFAULT_SESSION_MEMORY, bullets: [] } }),
+
+      setSettings: (patch) => {
+        set({ settings: normalizeAISettings({ ...get().settings, ...patch }) });
+        if (patch.perceptionRadius !== undefined) applySceneTriggers();
+      },
 
       setUISettings: (patch) => {
-        const next = { ...get().uiSettings, ...patch };
         set({
-          uiSettings: {
-            ...next,
-            gridSize: normalizeGridSize(next.gridSize),
-            gridOpacity: normalizeGridOpacity(next.gridOpacity),
-          },
+          uiSettings: normalizeUISettings({ ...get().uiSettings, ...patch }),
         });
       },
 
@@ -750,14 +1328,15 @@ export const useRAM = create<RAMState>()(
     {
       name: "ram-campaign",
       storage: createJSONStorage(() => campaignStateStorage),
-      version: 25,
+      version: 33,
       onRehydrateStorage: () => (state, error) => {
         markCampaignStorageReady();
         if (error || !state) return;
         const scene = readSceneView();
         if (!scene) return;
         useRAM.setState({
-          lighting: scene.lighting ?? state.lighting,
+          lighting: normalizeLighting(scene.lighting ?? state.lighting),
+          weather: normalizeWeather(scene.weather ?? state.weather),
           activeEnvironmentId:
             scene.activeEnvironmentId !== undefined
               ? scene.activeEnvironmentId
@@ -773,7 +1352,12 @@ export const useRAM = create<RAMState>()(
         return {
           ...currentState,
           ...persisted,
-          lighting: scene?.lighting ?? persisted.lighting ?? currentState.lighting,
+          lighting: normalizeLighting(
+            scene?.lighting ?? persisted.lighting ?? currentState.lighting
+          ),
+          weather: normalizeWeather(
+            scene?.weather ?? persisted.weather ?? currentState.weather
+          ),
           activeEnvironmentId:
             scene && "activeEnvironmentId" in scene
               ? scene.activeEnvironmentId
@@ -781,6 +1365,12 @@ export const useRAM = create<RAMState>()(
           mapCamera: scene?.mapCamera ?? persisted.mapCamera ?? currentState.mapCamera,
           activeView: scene?.activeView ?? persisted.activeView ?? currentState.activeView,
           background: persisted.background !== undefined ? persisted.background : currentState.background,
+          music: persisted.music !== undefined ? persisted.music : currentState.music,
+          ambience:
+            persisted.ambience !== undefined ? persisted.ambience : currentState.ambience,
+          saveAreas: persisted.saveAreas ?? currentState.saveAreas,
+          areaPresence: persisted.areaPresence ?? currentState.areaPresence,
+          creatureSheens: [],
         };
       },
       migrate: (persistedState, version) => {
@@ -810,6 +1400,26 @@ export const useRAM = create<RAMState>()(
           PREMADE_RULES.find(
             (rule) => rule.kind === kind && rule.name.toLowerCase() === (name ?? "").toLowerCase()
           )?.id ?? "";
+        /**
+         * Map tokens become stat block creatures, which is how the Monster
+         * Manual describes monsters, NPCs, and objects. Anything that was
+         * deliberately built from a race or class keeps that build, and player
+         * characters are always character-built.
+         */
+        const statBlockFor = (
+          value: Partial<PC | MapToken | TokenBlueprint>
+        ): StatBlock | null => {
+          const token = value as Partial<MapToken>;
+          if (!token.kind) return null;
+          if (token.statBlock) return cloneStatBlock(token.statBlock);
+          if (value.raceId || value.classId) return null;
+          return createStatBlock({
+            alignment: token.kind === "object" ? "Unaligned" : "True Neutral",
+            // Zero hit dice preserves the hit points already recorded here.
+            hitDice: 0,
+            speeds: { walk: token.kind === "object" ? 0 : 30 },
+          });
+        };
         const mechanics = <T extends Partial<PC | MapToken | TokenBlueprint>>(value: T) => ({
           raceId: value.raceId ?? ruleId("race", value.race) ?? "",
           subraceId: value.subraceId ?? ruleId("subrace", value.subrace) ?? "",
@@ -832,7 +1442,9 @@ export const useRAM = create<RAMState>()(
           level: value.level ?? 1,
           hp: value.hp ?? value.maxHp ?? 0,
           maxHp: value.maxHp ?? 0,
-          ac: value.ac ?? 10,
+          // Nothing is easier to hit than an unarmored creature standing still,
+          // and that is still armor class 10.
+          ac: value.ac || 10,
           abilities: { ...DEFAULT_ABILITIES, ...value.abilities },
           skills: value.skills ?? [],
           traits: value.traits ?? [],
@@ -854,7 +1466,9 @@ export const useRAM = create<RAMState>()(
             equipped: item.equipped ?? false,
           })),
           wallet: value.wallet ?? { copper: 0, silver: 0, gold: 0 },
+          statBlock: statBlockFor(value),
           portrait: value.portrait,
+          deathSaves: normalizeDeathSaves(value.deathSaves),
         });
         const priorItems = state.customLibraryItems ?? [];
         const priorRules = state.ruleDefinitions ?? [];
@@ -887,6 +1501,7 @@ export const useRAM = create<RAMState>()(
           return {
           ...value,
           category,
+          rarity: normalizeItemRarity(value.rarity),
           equipSlot: legacySlot === "trinket" ? "gear" : value.equipSlot ?? "none",
           armorClass: value.armorClass ?? 0,
           armorBonus: value.armorBonus ?? 0,
@@ -978,7 +1593,8 @@ export const useRAM = create<RAMState>()(
         return {
           ...state,
           pcs: (state.pcs ?? []).map((pc) =>
-            withCalculatedStats(
+            withPcLogistics(
+              withCalculatedStats(
               {
                 ...pc,
                 ...mechanics(pc),
@@ -987,6 +1603,7 @@ export const useRAM = create<RAMState>()(
                   customLibraryItems
                 ),
                 alignment: pc.alignment || "True Neutral",
+                knowledge: pc.knowledge ?? "",
                 width: pc.width ?? 1,
                 height: pc.height ?? 1,
                 bounds:
@@ -996,10 +1613,12 @@ export const useRAM = create<RAMState>()(
               },
               ruleDefinitions,
               customLibraryItems
+              )
             )
           ),
           tokens: (state.tokens ?? []).map((token) =>
-            withCalculatedStats(
+            withTokenLogistics(
+              withCalculatedStats(
               {
                 ...token,
                 ...mechanics(token),
@@ -1017,10 +1636,12 @@ export const useRAM = create<RAMState>()(
               },
               ruleDefinitions,
               customLibraryItems
+              )
             )
           ),
           customTokenBlueprints: (state.customTokenBlueprints ?? []).map((blueprint) =>
-            withCalculatedStats(
+            withTokenLogistics(
+              withCalculatedStats(
               {
                 ...blueprint,
                 ...mechanics(blueprint),
@@ -1035,6 +1656,7 @@ export const useRAM = create<RAMState>()(
               },
               ruleDefinitions,
               customLibraryItems
+              )
             )
           ),
           customLibraryItems,
@@ -1042,10 +1664,14 @@ export const useRAM = create<RAMState>()(
           environments: (state.environments ?? []).map((environment) => ({
             ...environment,
             notes: environment.notes ?? "",
-            lighting: environment.lighting ?? "daylight",
+            lighting: normalizeLighting(environment.lighting),
+            weather: normalizeWeather(environment.weather),
             background: environment.background ? { ...environment.background } : null,
+            music: cloneEnvironmentTrack(environment.music),
+            ambience: cloneEnvironmentTrack(environment.ambience),
             tokens: (environment.tokens ?? []).map((token) =>
-              withCalculatedStats(
+              withTokenLogistics(
+                withCalculatedStats(
                 {
                   ...token,
                   ...mechanics(token),
@@ -1061,26 +1687,41 @@ export const useRAM = create<RAMState>()(
                 },
                 ruleDefinitions,
                 customLibraryItems
+                )
               )
             ),
+            saveAreas: (environment.saveAreas ?? []).map((area) =>
+              normalizeSaveArea({
+                ...area,
+                id: area.id || crypto.randomUUID(),
+              })
+            ),
           })),
-          lighting: state.lighting ?? "daylight",
+          saveAreas: (state.saveAreas ?? []).map((area) =>
+            normalizeSaveArea({
+              ...area,
+              id: area.id || crypto.randomUUID(),
+            })
+          ),
+          areaPresence: (state.areaPresence ?? []).filter(
+            (entry) => entry.creatureId && entry.areaId
+          ),
+          lighting: normalizeLighting(state.lighting),
+          weather: normalizeWeather(state.weather),
+          music: cloneEnvironmentTrack(state.music),
+          ambience: cloneEnvironmentTrack(state.ambience),
           activeEnvironmentId: state.activeEnvironmentId ?? null,
           mapCamera: state.mapCamera ?? null,
           activeView: state.activeView === "world-map" ? "world-map" : "grid",
           deletedLibraryItemIds,
           deletedRuleDefinitionIds,
-          settings: normalizeAISettings(state.settings),
-          uiSettings: {
-            ...DEFAULT_UI_SETTINGS,
-            ...state.uiSettings,
-            gridSize: normalizeGridSize(
-              state.uiSettings?.gridSize ?? DEFAULT_GRID_SIZE
-            ),
-            gridOpacity: normalizeGridOpacity(
-              state.uiSettings?.gridOpacity ?? DEFAULT_GRID_OPACITY
-            ),
+          memory: {
+            ...DEFAULT_SESSION_MEMORY,
+            ...state.memory,
+            bullets: (state.memory?.bullets ?? []).filter(Boolean),
           },
+          settings: normalizeAISettings(state.settings),
+          uiSettings: normalizeUISettings(omitLegacyDiceLook(state.uiSettings)),
         };
       },
       partialize: (s) => ({
@@ -1091,14 +1732,19 @@ export const useRAM = create<RAMState>()(
         customLibraryItems: s.customLibraryItems,
         ruleDefinitions: s.ruleDefinitions,
         environments: s.environments,
+        saveAreas: s.saveAreas,
+        areaPresence: s.areaPresence,
         deletedLibraryItemIds: s.deletedLibraryItemIds,
         deletedRuleDefinitionIds: s.deletedRuleDefinitionIds,
         background: s.background,
         lighting: s.lighting,
+        weather: s.weather,
+        music: s.music,
+        ambience: s.ambience,
         activeEnvironmentId: s.activeEnvironmentId,
-        mapCamera: s.mapCamera,
         activeView: s.activeView,
         log: s.log,
+        memory: s.memory,
         settings: s.settings,
         uiSettings: s.uiSettings,
       }),
