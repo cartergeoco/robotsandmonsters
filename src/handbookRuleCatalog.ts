@@ -1,15 +1,25 @@
 import type {
+  AbilityScores,
   RuleChoiceDefinition,
   RuleDefinition,
   RuleFeature,
+  RuleFeatureGrants,
   RuleKind,
+  RuleResourceTrack,
+  RuleSpellcasting,
   StartingKitItem,
 } from "./types";
 
-const f = (level: number, name: string, effect: string): RuleFeature => ({
+const f = (
+  level: number,
+  name: string,
+  effect: string,
+  grants?: RuleFeatureGrants
+): RuleFeature => ({
   level,
   name,
   effect,
+  ...(grants ? { grants } : {}),
 });
 
 const rule = (
@@ -21,6 +31,10 @@ const rule = (
   id,
   kind,
   name,
+  minLevel: 1,
+  abilityScoreImprovementLevels: [],
+  resourceTracks: [],
+  spellcasting: null,
   abilityBonuses: {},
   saveBonuses: {},
   extraHp: 0,
@@ -75,7 +89,12 @@ const races: RuleDefinition[] = [
     sourcePage: 18,
     features: [
       f(1, "Dwarven Resilience", "Advantage on saves against poison; poison resistance."),
-      f(1, "Stonecunning", "Double proficiency on History checks about stonework."),
+      f(
+        1,
+        "Stonecunning",
+        "Double proficiency on History checks about stonework.",
+        { expertise: ["History"] }
+      ),
     ],
   }),
   rule("race-elf", "race", "Elf", {
@@ -114,7 +133,10 @@ const races: RuleDefinition[] = [
     sourcePage: 32,
     features: [
       f(1, "Draconic Ancestry", "Choose acid, cold, fire, lightning, or poison ancestry."),
-      f(1, "Breath Weapon", "Action: ancestry-shaped damage, save for half; recharges on rest."),
+      f(1, "Breath Weapon (2d6)", "Action: ancestry-shaped 2d6 damage, save for half; recharges on rest."),
+      f(6, "Breath Weapon (3d6)", "Breath Weapon damage increases to 3d6."),
+      f(11, "Breath Weapon (4d6)", "Breath Weapon damage increases to 4d6."),
+      f(16, "Breath Weapon (5d6)", "Breath Weapon damage increases to 5d6."),
       f(1, "Damage Resistance", "Resist the damage type of your draconic ancestry."),
     ],
   }),
@@ -162,7 +184,11 @@ const races: RuleDefinition[] = [
     languages: ["Infernal"],
     resistances: ["Fire"],
     sourcePage: 42,
-    features: [f(1, "Infernal Legacy", "Thaumaturgy; hellish rebuke at 3rd; darkness at 5th.")],
+    features: [
+      f(1, "Infernal Legacy: Thaumaturgy", "Know the thaumaturgy cantrip; Charisma is the casting ability."),
+      f(3, "Infernal Legacy: Hellish Rebuke", "Cast hellish rebuke as a 2nd-level spell once per long rest."),
+      f(5, "Infernal Legacy: Darkness", "Cast darkness once per long rest."),
+    ],
   }),
 ];
 
@@ -203,7 +229,9 @@ const subraces: RuleDefinition[] = [
     sourcePage: 24,
     features: [
       f(1, "Sunlight Sensitivity", "Disadvantage on sight-based attacks and Perception in direct sun."),
-      f(1, "Drow Magic", "Dancing lights; faerie fire at 3rd; darkness at 5th."),
+      f(1, "Drow Magic: Dancing Lights", "Know the dancing lights cantrip; Charisma is the casting ability."),
+      f(3, "Drow Magic: Faerie Fire", "Cast faerie fire once per long rest."),
+      f(5, "Drow Magic: Darkness", "Cast darkness once per long rest."),
     ],
   }),
   rule("subrace-lightfoot", "subrace", "Lightfoot Halfling", {
@@ -260,6 +288,244 @@ const kit = (
         }
   );
 
+const FULL_CASTER_SLOTS = [
+  [2],
+  [3],
+  [4, 2],
+  [4, 3],
+  [4, 3, 2],
+  [4, 3, 3],
+  [4, 3, 3, 1],
+  [4, 3, 3, 2],
+  [4, 3, 3, 3, 1],
+  [4, 3, 3, 3, 2],
+  [4, 3, 3, 3, 2, 1],
+  [4, 3, 3, 3, 2, 1],
+  [4, 3, 3, 3, 2, 1, 1],
+  [4, 3, 3, 3, 2, 1, 1],
+  [4, 3, 3, 3, 2, 1, 1, 1],
+  [4, 3, 3, 3, 2, 1, 1, 1],
+  [4, 3, 3, 3, 2, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 2, 1, 1],
+];
+
+const HALF_CASTER_SLOTS = [
+  [],
+  [2],
+  [3],
+  [3],
+  [4, 2],
+  [4, 2],
+  [4, 3],
+  [4, 3],
+  [4, 3, 2],
+  [4, 3, 2],
+  [4, 3, 3],
+  [4, 3, 3],
+  [4, 3, 3, 1],
+  [4, 3, 3, 1],
+  [4, 3, 3, 2],
+  [4, 3, 3, 2],
+  [4, 3, 3, 3, 1],
+  [4, 3, 3, 3, 1],
+  [4, 3, 3, 3, 2],
+  [4, 3, 3, 3, 2],
+];
+
+const THIRD_CASTER_SLOTS = [
+  [],
+  [],
+  [2],
+  [3],
+  [3],
+  [3],
+  [4, 2],
+  [4, 2],
+  [4, 2],
+  [4, 3],
+  [4, 3],
+  [4, 3],
+  [4, 3, 2],
+  [4, 3, 2],
+  [4, 3, 2],
+  [4, 3, 3],
+  [4, 3, 3],
+  [4, 3, 3],
+  [4, 3, 3, 1],
+  [4, 3, 3, 1],
+];
+
+const fullCasterSlots = (
+  ability: keyof AbilityScores,
+  cantripsKnown: number[],
+  spellsKnown?: number[]
+): RuleSpellcasting => ({
+  mode: "standard",
+  ability,
+  slotsByLevel: FULL_CASTER_SLOTS,
+  cantripsKnown,
+  ...(spellsKnown ? { spellsKnown } : {}),
+});
+
+const halfCasterSlots = (
+  ability: keyof AbilityScores,
+  spellsKnown?: number[]
+): RuleSpellcasting => ({
+  mode: "standard",
+  ability,
+  slotsByLevel: HALF_CASTER_SLOTS,
+  ...(spellsKnown ? { spellsKnown } : {}),
+});
+
+const thirdCasterSlots = (
+  ability: keyof AbilityScores,
+  cantripsKnown: number[],
+  spellsKnown: number[]
+): RuleSpellcasting => ({
+  mode: "standard",
+  ability,
+  slotsByLevel: THIRD_CASTER_SLOTS,
+  cantripsKnown,
+  spellsKnown,
+});
+
+const warlockPactSlots = (): RuleSpellcasting => ({
+  mode: "pact",
+  ability: "cha",
+  slotsByLevel: [
+    [1], [2], [2], [2], [2], [2], [2], [2], [2], [2],
+    [3], [3], [3], [3], [3], [3], [4], [4], [4], [4],
+  ],
+  slotLevels: [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+  cantripsKnown: [2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+  spellsKnown: [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15],
+});
+
+const track = (
+  id: string,
+  name: string,
+  unit: string,
+  values: Array<readonly [number, number | string]>
+): RuleResourceTrack => ({
+  id,
+  name,
+  unit,
+  values: values.map(([level, value]) => ({ level, value })),
+});
+
+const perLevelTrack = (
+  id: string,
+  name: string,
+  unit: string,
+  startLevel: number,
+  valueAtLevel: (level: number) => number | string
+): RuleResourceTrack =>
+  track(
+    id,
+    name,
+    unit,
+    Array.from({ length: 21 - startLevel }, (_, index) => {
+      const level = startLevel + index;
+      return [level, valueAtLevel(level)] as const;
+    })
+  );
+
+const BARD_CANTRIPS = [2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+const BARD_SPELLS = [4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 15, 16, 18, 19, 19, 20, 22, 22, 22];
+const CLERIC_CANTRIPS = [3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6];
+const DRUID_CANTRIPS = [2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
+const SORCERER_CANTRIPS = [4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6];
+const SORCERER_SPELLS = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 13, 13, 14, 14, 15, 15, 15, 15];
+const WIZARD_CANTRIPS = [3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+const RANGER_SPELLS = [0, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11];
+
+const CLASS_PROGRESSION: Record<
+  string,
+  { spellcasting: RuleSpellcasting | null; resourceTracks: RuleResourceTrack[] }
+> = {
+  barbarian: {
+    spellcasting: null,
+    resourceTracks: [
+      track("rage-uses", "Rage uses", "uses", [[1, 2], [3, 3], [6, 4], [12, 5], [17, 6], [20, "Unlimited"]]),
+      track("rage-damage", "Rage damage", "bonus damage", [[1, 2], [9, 3], [16, 4]]),
+      track("extra-attack", "Attacks per Attack action", "attacks", [[1, 1], [5, 2]]),
+    ],
+  },
+  bard: {
+    spellcasting: fullCasterSlots("cha", BARD_CANTRIPS, BARD_SPELLS),
+    resourceTracks: [
+      track("bardic-inspiration-die", "Bardic Inspiration die", "die", [[1, "d6"], [5, "d8"], [10, "d10"], [15, "d12"]]),
+    ],
+  },
+  cleric: {
+    spellcasting: fullCasterSlots("wis", CLERIC_CANTRIPS),
+    resourceTracks: [
+      track("channel-divinity", "Channel Divinity uses", "uses", [[2, 1], [6, 2], [18, 3]]),
+    ],
+  },
+  druid: {
+    spellcasting: fullCasterSlots("wis", DRUID_CANTRIPS),
+    resourceTracks: [track("wild-shape", "Wild Shape uses", "uses", [[2, 2]])],
+  },
+  fighter: {
+    spellcasting: null,
+    resourceTracks: [
+      track("second-wind", "Second Wind uses", "uses", [[1, 1]]),
+      track("action-surge", "Action Surge uses", "uses", [[2, 1], [17, 2]]),
+      track("extra-attack", "Attacks per Attack action", "attacks", [[1, 1], [5, 2], [11, 3], [20, 4]]),
+      track("indomitable", "Indomitable uses", "uses", [[9, 1], [13, 2], [17, 3]]),
+    ],
+  },
+  monk: {
+    spellcasting: null,
+    resourceTracks: [
+      perLevelTrack("ki", "Ki points", "points", 2, (level) => level),
+      track("martial-arts-die", "Martial Arts die", "die", [[1, "d4"], [5, "d6"], [11, "d8"], [17, "d10"]]),
+      track("extra-attack", "Attacks per Attack action", "attacks", [[1, 1], [5, 2]]),
+    ],
+  },
+  paladin: {
+    spellcasting: halfCasterSlots("cha"),
+    resourceTracks: [
+      perLevelTrack("lay-on-hands", "Lay on Hands pool", "hit points", 1, (level) => level * 5),
+      track("channel-divinity", "Channel Divinity uses", "uses", [[3, 1]]),
+      track("extra-attack", "Attacks per Attack action", "attacks", [[1, 1], [5, 2]]),
+    ],
+  },
+  ranger: {
+    spellcasting: halfCasterSlots("wis", RANGER_SPELLS),
+    resourceTracks: [
+      track("extra-attack", "Attacks per Attack action", "attacks", [[1, 1], [5, 2]]),
+    ],
+  },
+  rogue: {
+    spellcasting: null,
+    resourceTracks: [
+      perLevelTrack("sneak-attack", "Sneak Attack", "d6", 1, (level) => Math.ceil(level / 2)),
+    ],
+  },
+  sorcerer: {
+    spellcasting: fullCasterSlots("cha", SORCERER_CANTRIPS, SORCERER_SPELLS),
+    resourceTracks: [
+      perLevelTrack("sorcery-points", "Sorcery points", "points", 2, (level) => level),
+    ],
+  },
+  warlock: {
+    spellcasting: warlockPactSlots(),
+    resourceTracks: [
+      track("invocations-known", "Eldritch Invocations known", "invocations", [[2, 2], [5, 3], [7, 4], [9, 5], [12, 6], [15, 7], [18, 8]]),
+    ],
+  },
+  wizard: {
+    spellcasting: fullCasterSlots("int", WIZARD_CANTRIPS),
+    resourceTracks: [],
+  },
+};
+
+const STANDARD_ASI_LEVELS = [4, 8, 12, 16, 19];
+
 const classSeed = (
   id: string,
   name: string,
@@ -272,6 +538,14 @@ const classSeed = (
   unarmoredAcAbilities: RuleDefinition["unarmoredAcAbilities"] = []
 ) =>
   rule(`class-${id}`, "class", name, {
+    abilityScoreImprovementLevels:
+      id === "fighter"
+        ? [4, 6, 8, 12, 14, 16, 19]
+        : id === "rogue"
+          ? [4, 8, 10, 12, 16, 19]
+          : STANDARD_ASI_LEVELS,
+    spellcasting: CLASS_PROGRESSION[id]?.spellcasting ?? null,
+    resourceTracks: CLASS_PROGRESSION[id]?.resourceTracks ?? [],
     hitDie,
     saveProficiencies: saves,
     proficiencies,
@@ -295,7 +569,12 @@ const classes: RuleDefinition[] = [
   classSeed("bard", "Bard", 8, ["dex", "cha"], ["Light armor", "Simple weapons", "Hand crossbow", "Longsword", "Rapier", "Shortsword", "Three musical instruments", "Choose three skills"], 51, [
     f(1, "Spellcasting", "Known Charisma spellcasting."),
     f(1, "Bardic Inspiration", "Bonus action grants a level-scaled die to an ally's roll."),
-    f(2, "Jack of All Trades", "Add half proficiency to unproficient ability checks."),
+    f(
+      2,
+      "Jack of All Trades",
+      "Add half proficiency to unproficient ability checks.",
+      { halfProficiencyAbilities: ["str", "dex", "con", "int", "wis", "cha"] }
+    ),
     f(2, "Song of Rest", "Allies regain extra HP on short rests."),
     f(3, "Expertise", "Double proficiency for two skills; two more at 10th."),
     f(10, "Magical Secrets", "Learn spells from any class; more at 14th and 18th."),
@@ -376,13 +655,23 @@ const subclass = (
   parentId: string,
   sourcePage: number,
   features: RuleFeature[],
-  proficiencies: string[] = []
+  proficiencies: string[] = [],
+  patch: Partial<RuleDefinition> = {}
 ) =>
   rule(`subclass-${id}`, "subclass", name, {
     parentId,
+    minLevel:
+      parentId === "class-cleric" ||
+      parentId === "class-sorcerer" ||
+      parentId === "class-warlock"
+        ? 1
+        : parentId === "class-druid" || parentId === "class-wizard"
+          ? 2
+          : 3,
     sourcePage,
     features,
     proficiencies,
+    ...patch,
   });
 
 const subclasses: RuleDefinition[] = [
@@ -477,7 +766,12 @@ const subclasses: RuleDefinition[] = [
   ]),
   subclass("champion", "Champion", "class-fighter", 72, [
     f(3, "Improved Critical", "Critical hits on 19-20."),
-    f(7, "Remarkable Athlete", "Add half proficiency to unproficient STR/DEX/CON checks; longer jumps."),
+    f(
+      7,
+      "Remarkable Athlete",
+      "Add half proficiency to unproficient STR/DEX/CON checks; longer jumps.",
+      { halfProficiencyAbilities: ["str", "dex", "con"] }
+    ),
     f(10, "Additional Fighting Style", "Choose a second fighting style."),
     f(15, "Superior Critical", "Critical hits on 18-20."),
     f(18, "Survivor", "Regain 5 + CON mod HP at the start of your turn if below half HP."),
@@ -488,7 +782,12 @@ const subclasses: RuleDefinition[] = [
     f(7, "Know Your Enemy", "Study a creature to learn how it compares to you."),
     f(10, "Improved Combat Superiority", "Superiority dice become d10, then d12 at 18th."),
     f(15, "Relentless", "Regain one superiority die if you start a fight with none."),
-  ]),
+  ], [], {
+    resourceTracks: [
+      track("superiority-dice", "Superiority dice", "dice", [[3, 4], [7, 5], [15, 6]]),
+      track("superiority-die", "Superiority die", "die", [[3, "d8"], [10, "d10"], [18, "d12"]]),
+    ],
+  }),
   subclass("eldritch-knight", "Eldritch Knight", "class-fighter", 74, [
     f(3, "Spellcasting", "Prepared wizard spells, mostly abjuration and evocation."),
     f(3, "Weapon Bond", "Can't be disarmed of a bonded weapon; summon it as a bonus action."),
@@ -496,7 +795,13 @@ const subclasses: RuleDefinition[] = [
     f(10, "Eldritch Strike", "A hit imposes disadvantage on the next save vs your spell before your next turn."),
     f(15, "Arcane Charge", "Teleport 30 ft. when you Action Surge."),
     f(18, "Improved War Magic", "Bonus weapon attack after any spell."),
-  ]),
+  ], [], {
+    spellcasting: thirdCasterSlots(
+      "int",
+      [0, 0, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+      [0, 0, 3, 4, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 11, 11, 12, 13]
+    ),
+  }),
   subclass("open-hand", "Way of the Open Hand", "class-monk", 79, [
     f(3, "Open Hand Technique", "On Flurry of Blows hit: prone, push, or deny reactions."),
     f(6, "Wholeness of Body", "Action: regain 3 x monk level HP once per long rest."),
@@ -565,14 +870,20 @@ const subclasses: RuleDefinition[] = [
     f(9, "Magical Ambush", "Creatures have disadvantage on saves vs your spells if you are hidden."),
     f(13, "Versatile Trickster", "Bonus action: mage hand grants you advantage on one attack."),
     f(17, "Spell Thief", "Reaction: steal a spell on a failed save and cast it later."),
-  ]),
+  ], [], {
+    spellcasting: thirdCasterSlots(
+      "int",
+      [0, 0, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+      [0, 0, 3, 4, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 11, 11, 11, 12, 13]
+    ),
+  }),
   subclass("draconic", "Draconic Bloodline", "class-sorcerer", 102, [
     f(1, "Dragon Ancestor", "Speak Draconic; double proficiency on CHA checks vs dragons."),
     f(1, "Draconic Resilience", "+1 HP per sorcerer level; unarmored AC 13 + DEX."),
     f(6, "Elemental Affinity", "Add CHA mod to ancestry damage; spend 1 sorcery point to resist that type for 1 hour."),
     f(14, "Dragon Wings", "Bonus action grow wings; fly speed equals walking speed."),
     f(18, "Draconic Presence", "Aura of awe or fear; 5 sorcery points."),
-  ]),
+  ], [], { extraHp: 1 }),
   subclass("wild-magic", "Wild Magic", "class-sorcerer", 103, [
     f(1, "Wild Magic Surge", "Casting a sorcerer spell can trigger a random surge."),
     f(1, "Tides of Chaos", "Gain advantage on one roll; the next spell may surge."),
@@ -701,14 +1012,44 @@ const choice = (
   count: number,
   options: string[],
   allowCustom = false,
-  bonus = 1
-): RuleChoiceDefinition => ({ id, label, target, count, options, allowCustom, bonus });
+  bonus = 1,
+  level = 1,
+  levelCounts?: RuleChoiceDefinition["levelCounts"]
+): RuleChoiceDefinition => ({
+  id,
+  label,
+  target,
+  level,
+  count,
+  options,
+  allowCustom,
+  bonus,
+  ...(levelCounts ? { levelCounts } : {}),
+});
 const classSkills = (
   count: number,
   options: string[]
 ): RuleChoiceDefinition => choice("class-skills", "Class skills", "proficiency", count, options);
 const languageChoice = (count: number): RuleChoiceDefinition =>
   choice("languages", "Languages", "language", count, ALL_LANGUAGES, true);
+const FIGHTING_STYLES = [
+  "Archery",
+  "Defense",
+  "Dueling",
+  "Great Weapon Fighting",
+  "Protection",
+  "Two-Weapon Fighting",
+];
+const METAMAGIC_OPTIONS = [
+  "Careful Spell",
+  "Distant Spell",
+  "Empowered Spell",
+  "Extended Spell",
+  "Heightened Spell",
+  "Quickened Spell",
+  "Subtle Spell",
+  "Twinned Spell",
+];
 
 const RULE_CHOICES: Record<string, RuleChoiceDefinition[]> = {
   "race-human": [languageChoice(1)],
@@ -747,19 +1088,86 @@ const RULE_CHOICES: Record<string, RuleChoiceDefinition[]> = {
   "class-bard": [
     classSkills(3, ALL_SKILLS),
     choice("instruments", "Musical instruments", "proficiency", 3, INSTRUMENTS, true),
+    choice(
+      "expertise",
+      "Expertise skills",
+      "expertise",
+      2,
+      ALL_SKILLS,
+      false,
+      1,
+      3,
+      [{ level: 10, count: 4 }]
+    ),
   ],
   "class-cleric": [classSkills(2, ["History", "Insight", "Medicine", "Persuasion", "Religion"])],
   "class-druid": [classSkills(2, ["Arcana", "Animal Handling", "Insight", "Medicine", "Nature", "Perception", "Religion", "Survival"])],
-  "class-fighter": [classSkills(2, ["Acrobatics", "Animal Handling", "Athletics", "History", "Insight", "Intimidation", "Perception", "Survival"])],
+  "class-fighter": [
+    classSkills(2, ["Acrobatics", "Animal Handling", "Athletics", "History", "Insight", "Intimidation", "Perception", "Survival"]),
+    choice("fighting-style", "Fighting Style", "trait", 1, FIGHTING_STYLES),
+  ],
   "class-monk": [
     classSkills(2, ["Acrobatics", "Athletics", "History", "Insight", "Religion", "Stealth"]),
     choice("tool-or-instrument", "Tool or instrument", "proficiency", 1, [...ARTISAN_TOOLS, ...INSTRUMENTS], true),
   ],
-  "class-paladin": [classSkills(2, ["Athletics", "Insight", "Intimidation", "Medicine", "Persuasion", "Religion"])],
-  "class-ranger": [classSkills(3, ["Animal Handling", "Athletics", "Insight", "Investigation", "Nature", "Perception", "Stealth", "Survival"])],
-  "class-rogue": [classSkills(4, ["Acrobatics", "Athletics", "Deception", "Insight", "Intimidation", "Investigation", "Perception", "Performance", "Persuasion", "Sleight of Hand", "Stealth"])],
-  "class-sorcerer": [classSkills(2, ["Arcana", "Deception", "Insight", "Intimidation", "Persuasion", "Religion"])],
-  "class-warlock": [classSkills(2, ["Arcana", "Deception", "History", "Intimidation", "Investigation", "Nature", "Religion"])],
+  "class-paladin": [
+    classSkills(2, ["Athletics", "Insight", "Intimidation", "Medicine", "Persuasion", "Religion"]),
+    choice("fighting-style", "Fighting Style", "trait", 1, FIGHTING_STYLES.filter((style) => style !== "Archery"), false, 1, 2),
+  ],
+  "class-ranger": [
+    classSkills(3, ["Animal Handling", "Athletics", "Insight", "Investigation", "Nature", "Perception", "Stealth", "Survival"]),
+    choice("fighting-style", "Fighting Style", "trait", 1, ["Archery", "Defense", "Dueling", "Two-Weapon Fighting"], false, 1, 2),
+  ],
+  "class-rogue": [
+    classSkills(4, ["Acrobatics", "Athletics", "Deception", "Insight", "Intimidation", "Investigation", "Perception", "Performance", "Persuasion", "Sleight of Hand", "Stealth"]),
+    choice(
+      "expertise",
+      "Expertise proficiencies",
+      "expertise",
+      2,
+      [...ALL_SKILLS, "Thieves' tools"],
+      false,
+      1,
+      1,
+      [{ level: 6, count: 4 }]
+    ),
+  ],
+  "class-sorcerer": [
+    classSkills(2, ["Arcana", "Deception", "Insight", "Intimidation", "Persuasion", "Religion"]),
+    choice(
+      "metamagic",
+      "Metamagic options",
+      "trait",
+      2,
+      METAMAGIC_OPTIONS,
+      false,
+      1,
+      3,
+      [{ level: 10, count: 3 }, { level: 17, count: 4 }]
+    ),
+  ],
+  "class-warlock": [
+    classSkills(2, ["Arcana", "Deception", "History", "Intimidation", "Investigation", "Nature", "Religion"]),
+    choice(
+      "invocations",
+      "Eldritch Invocations",
+      "trait",
+      2,
+      [],
+      true,
+      1,
+      2,
+      [
+        { level: 5, count: 3 },
+        { level: 7, count: 4 },
+        { level: 9, count: 5 },
+        { level: 12, count: 6 },
+        { level: 15, count: 7 },
+        { level: 18, count: 8 },
+      ]
+    ),
+    choice("pact-boon", "Pact Boon", "trait", 1, ["Pact of the Chain", "Pact of the Blade", "Pact of the Tome"], false, 1, 3),
+  ],
   "class-wizard": [classSkills(2, ["Arcana", "History", "Insight", "Investigation", "Medicine", "Religion"])],
   "background-acolyte": [languageChoice(2)],
   "background-entertainer": [choice("instrument", "Musical instrument", "proficiency", 1, INSTRUMENTS, true)],
@@ -777,6 +1185,22 @@ const RULE_CHOICES: Record<string, RuleChoiceDefinition[]> = {
   "background-sage": [languageChoice(2)],
   "subclass-lore": [choice("bonus-skills", "Bonus skills", "proficiency", 3, ALL_SKILLS)],
   "subclass-battle-master": [choice("artisan-tool", "Artisan's tool", "proficiency", 1, ARTISAN_TOOLS, true)],
+  "subclass-champion": [
+    choice("additional-fighting-style", "Additional Fighting Style", "trait", 1, FIGHTING_STYLES, false, 1, 10),
+  ],
+  "subclass-four-elements": [
+    choice(
+      "elemental-disciplines",
+      "Elemental Disciplines",
+      "trait",
+      1,
+      [],
+      true,
+      1,
+      3,
+      [{ level: 6, count: 2 }, { level: 11, count: 3 }, { level: 17, count: 4 }]
+    ),
+  ],
 };
 
 export const HANDBOOK_RULES: RuleDefinition[] = [

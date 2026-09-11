@@ -91,6 +91,7 @@ const item = (
     id: `item-${id}`,
     category,
     name: UNIFORM_ITEM_NAMES[id] ?? name,
+    rarity: "common",
     description: "",
     value: costCp / 100,
     weight,

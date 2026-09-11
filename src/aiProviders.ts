@@ -26,6 +26,7 @@ export interface AIProviderSpec {
   canListModels: boolean;
   note: string;
   credentialGroup: AIProvider;
+  toolMode: "native" | "text";
 }
 
 export const AI_PROVIDER_GROUPS = [
@@ -41,7 +42,22 @@ function model(id: string, label = id): { id: string; label: string } {
   return { id, label };
 }
 
-export const AI_PROVIDER_CATALOG: Record<AIProvider, AIProviderSpec> = {
+type AIProviderSpecInput = Omit<AIProviderSpec, "toolMode"> & {
+  toolMode?: AIProviderSpec["toolMode"];
+};
+
+function withToolModes(
+  catalog: Record<AIProvider, AIProviderSpecInput>
+): Record<AIProvider, AIProviderSpec> {
+  return Object.fromEntries(
+    Object.entries(catalog).map(([id, spec]) => [
+      id,
+      { ...spec, toolMode: spec.toolMode ?? "native" },
+    ])
+  ) as Record<AIProvider, AIProviderSpec>;
+}
+
+export const AI_PROVIDER_CATALOG: Record<AIProvider, AIProviderSpec> = withToolModes({
   ollama: {
     id: "ollama",
     label: "Ollama",
@@ -406,7 +422,7 @@ export const AI_PROVIDER_CATALOG: Record<AIProvider, AIProviderSpec> = {
     note: "Any OpenAI-compatible /v1 endpoint. Include /v1 in the base URL.",
     credentialGroup: "custom",
   },
-};
+});
 
 export function providerSpec(provider: AIProvider): AIProviderSpec {
   return AI_PROVIDER_CATALOG[provider] ?? AI_PROVIDER_CATALOG.custom;
@@ -477,6 +493,21 @@ export function normalizeAISettings(settings: Partial<AISettings> = {}): AISetti
       ? (reasoning as AIReasoningEffort)
       : "medium",
     extraInstructions: settings.extraInstructions ?? "",
+    perceptionRadius:
+      Math.round(
+        clamp(
+          settings.perceptionRadius ?? DEFAULT_AI_SETTINGS.perceptionRadius,
+          5,
+          300
+        ) / 5
+      ) * 5,
+    loreBudget: Math.round(
+      clamp(settings.loreBudget ?? DEFAULT_AI_SETTINGS.loreBudget, 0, 4000)
+    ),
+    memoryEnabled: settings.memoryEnabled ?? DEFAULT_AI_SETTINGS.memoryEnabled,
+    memoryBullets: Math.round(
+      clamp(settings.memoryBullets ?? DEFAULT_AI_SETTINGS.memoryBullets, 4, 24)
+    ),
     azureDeployment: settings.azureDeployment ?? "",
     azureApiVersion: settings.azureApiVersion || "2024-10-21",
     savedKeys,

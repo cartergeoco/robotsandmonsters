@@ -1,5 +1,17 @@
-import { Github, Map, Settings } from "lucide-react";
+import { FolderOpen, Github, Map, Redo2, Settings, Undo2 } from "lucide-react";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  getHistoryStatus,
+  redoCampaignChange,
+  subscribeHistory,
+  undoCampaignChange,
+} from "../history";
+import {
+  getCampaignStorageStatus,
+  subscribeCampaignStorageStatus,
+} from "../persistStorage";
 import { useRAM } from "../store";
+import { OPEN_CAMPAIGNS_EVENT } from "./QoLHost";
 import { RamIconButton, RamInput } from "./ui/RamPrimitives";
 
 export function TopBar() {
@@ -8,6 +20,44 @@ export function TopBar() {
   const setSettingsOpen = useRAM((s) => s.setSettingsOpen);
   const activeView = useRAM((s) => s.activeView);
   const setActiveView = useRAM((s) => s.setActiveView);
+  const [history, setHistory] = useState(() => getHistoryStatus());
+  const storage = useSyncExternalStore(
+    subscribeCampaignStorageStatus,
+    getCampaignStorageStatus,
+    getCampaignStorageStatus
+  );
+
+  const [saveNotice, setSaveNotice] = useState("");
+
+  useEffect(() => subscribeHistory(() => setHistory(getHistoryStatus())), []);
+
+  useEffect(() => {
+    if (storage.state === "saving") {
+      setSaveNotice("Saving…");
+      return;
+    }
+    if (storage.state === "error") {
+      setSaveNotice("Save failed");
+      return;
+    }
+    if (!storage.lastSavedAt) {
+      setSaveNotice("");
+      return;
+    }
+    const remaining = 30_000 - (Date.now() - storage.lastSavedAt);
+    if (remaining <= 0) {
+      setSaveNotice("");
+      return;
+    }
+    setSaveNotice(
+      `Saved ${new Date(storage.lastSavedAt).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })}`
+    );
+    const timer = window.setTimeout(() => setSaveNotice(""), remaining);
+    return () => window.clearTimeout(timer);
+  }, [storage.lastSavedAt, storage.state]);
 
   return (
     <div className="topbar">
@@ -35,8 +85,36 @@ export function TopBar() {
           spellCheck={false}
           aria-label="Campaign name"
         />
+        {saveNotice && (
+          <small
+            className={`save-indicator${storage.state === "error" ? " save-indicator--error" : ""}`}
+            aria-live="polite"
+          >
+            {saveNotice}
+          </small>
+        )}
       </span>
       <span className="topbar-actions topbar-actions--right">
+        <RamIconButton
+          label="Undo last campaign change"
+          disabled={!history.canUndo}
+          onClick={undoCampaignChange}
+        >
+          <Undo2 size={16} strokeWidth={1.5} />
+        </RamIconButton>
+        <RamIconButton
+          label="Redo campaign change"
+          disabled={!history.canRedo}
+          onClick={redoCampaignChange}
+        >
+          <Redo2 size={16} strokeWidth={1.5} />
+        </RamIconButton>
+        <RamIconButton
+          label="Campaigns and backups"
+          onClick={() => window.dispatchEvent(new Event(OPEN_CAMPAIGNS_EVENT))}
+        >
+          <FolderOpen size={16} strokeWidth={1.5} />
+        </RamIconButton>
         <a
           href="https://github.com/cartergeoco/robotsandmonsters"
           className="topbar-link"

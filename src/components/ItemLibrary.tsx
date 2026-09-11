@@ -1,18 +1,26 @@
 import { Copy, Plus, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRAM } from "../store";
+import { flushCampaignWrites } from "../persistStorage";
+import { useLibraryDraft } from "../useLibraryDraft";
+import { useLibraryUnsaved, useRegisterUnsaved } from "../libraryUnsaved";
 import {
   CONTAINER_TYPES,
   DAMAGE_DICE,
   DAMAGE_TYPES,
   ITEM_CATEGORIES,
+  ITEM_RARITIES,
+  ITEM_RARITY_LABELS,
   WEAPON_PROPERTIES,
   type DamageDie,
   type ItemCategory,
+  type ItemRarity,
   type LibraryItem,
 } from "../types";
+import { ItemName, itemRarityClassName, itemRarityStyle } from "./ItemName";
 import { fileToDataURL } from "../util";
 import {
+  RamConfirmDialog,
   RamField,
   RamIconButton,
   RamInput,
@@ -58,6 +66,7 @@ function newItem(category: ItemCategory): LibraryItem {
     id: crypto.randomUUID(),
     category,
     name: `New ${CATEGORY_LABELS[category].replace(/s$/, "")}`,
+    rarity: "common",
     description: "",
     value: 0,
     weight: 0,
@@ -101,17 +110,51 @@ export function ItemLibrary() {
   const addItem = useRAM((state) => state.addLibraryItem);
   const updateItem = useRAM((state) => state.updateLibraryItem);
   const deleteItem = useRAM((state) => state.deleteLibraryItem);
+  const confirmDeletes = useRAM((state) => state.uiSettings.confirmDeletes);
   const [category, setCategory] = useState<ItemCategory>("weapon");
   const [selectedId, setSelectedId] = useState("");
+  const [query, setQuery] = useState("");
+  const [rarity, setRarity] = useState<ItemRarity | "all">("all");
+  const [recentIds, setRecentIds] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("ram-recent-items") || "[]");
+    } catch {
+      return [];
+    }
+  });
+  const [deleteTarget, setDeleteTarget] = useState<LibraryItem | undefined>();
   const imageRef = useRef<HTMLInputElement>(null);
   const visibleItems = useMemo(
     () =>
       items
         .filter((item) => item.category === category)
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    [category, items]
+        .filter((item) => rarity === "all" || item.rarity === rarity)
+        .filter((item) => {
+          const needle = query.trim().toLocaleLowerCase();
+          return !needle ||
+            item.name.toLocaleLowerCase().includes(needle) ||
+            item.description.toLocaleLowerCase().includes(needle) ||
+            item.properties.some((property) => property.toLocaleLowerCase().includes(needle));
+        })
+        .sort((a, b) => {
+          const ai = recentIds.indexOf(a.id);
+          const bi = recentIds.indexOf(b.id);
+          if (ai >= 0 || bi >= 0) {
+            if (ai < 0) return 1;
+            if (bi < 0) return -1;
+            return ai - bi;
+          }
+          return a.name.localeCompare(b.name);
+        }),
+    [category, items, query, rarity, recentIds]
   );
-  const selected = items.find((item) => item.id === selectedId) ?? visibleItems[0];
+  const stored = items.find((item) => item.id === selectedId) ?? visibleItems[0];
+  const { draft: selected, dirty, patch, save, discard } = useLibraryDraft(stored, (value) => {
+    updateItem(value.id, value);
+    flushCampaignWrites();
+  });
+  useRegisterUnsaved(dirty, save, discard);
+  const { requestLeave } = useLibraryUnsaved();
 
   useEffect(() => {
     if (!selected || selected.category !== category) {
@@ -120,9 +163,21 @@ export function ItemLibrary() {
   }, [category, selected, visibleItems]);
 
   function create() {
-    const value = newItem(category);
-    addItem(value);
-    setSelectedId(value.id);
+    requestLeave(() => {
+      const value = newItem(category);
+      addItem(value);
+      setSelectedId(value.id);
+    });
+  }
+
+  function selectItem(id: string) {
+    if (id === selected?.id) return;
+    requestLeave(() => {
+      setSelectedId(id);
+      const next = [id, ...recentIds.filter((entry) => entry !== id)].slice(0, 8);
+      setRecentIds(next);
+      localStorage.setItem("ram-recent-items", JSON.stringify(next));
+    });
   }
 
   function duplicate(value: LibraryItem) {
@@ -141,7 +196,7 @@ export function ItemLibrary() {
 
   const updateDamage = (count: number, die: DamageDie) => {
     if (!selected) return;
-    updateItem(selected.id, {
+    patch( {
       damageDiceCount: count,
       damageDie: die,
       damage: damageText(count, die),
@@ -149,6 +204,7 @@ export function ItemLibrary() {
   };
 
   return (
+    <>
     <div className="item-library">
       <nav className="item-category-tabs" aria-label="Item categories">
         {ITEM_CATEGORIES.map((entry) => (
@@ -156,7 +212,10 @@ export function ItemLibrary() {
             key={entry}
             className={entry === category ? "is-active" : ""}
             aria-current={entry === category ? "page" : undefined}
-            onClick={() => setCategory(entry)}
+            onClick={() => {
+              if (entry === category) return;
+              requestLeave(() => setCategory(entry));
+            }}
           >
             <span>{CATEGORY_LABELS[entry]}</span>
             <small>{items.filter((item) => item.category === entry).length}</small>
@@ -174,12 +233,31 @@ export function ItemLibrary() {
             <Plus size={17} strokeWidth={1.5} />
           </RamIconButton>
         </div>
+        <div className="library-search-row">
+          <RamInput
+            type="search"
+            value={query}
+            placeholder="Search items…"
+            aria-label="Search item library"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <RamSelect
+            value={rarity}
+            aria-label="Filter item rarity"
+            onChange={(event) => setRarity(event.target.value as ItemRarity | "all")}
+          >
+            <option value="all">All rarities</option>
+            {ITEM_RARITIES.map((entry) => (
+              <option value={entry} key={entry}>{ITEM_RARITY_LABELS[entry]}</option>
+            ))}
+          </RamSelect>
+        </div>
         <div className="item-catalog-list">
           {visibleItems.map((item) => (
             <button
               key={item.id}
               className={`item-catalog-entry${item.id === selected?.id ? " is-selected" : ""}`}
-              onClick={() => setSelectedId(item.id)}
+              onClick={() => selectItem(item.id)}
             >
               {item.image ? (
                 <img className="item-catalog-thumb" src={item.image} alt="" />
@@ -187,7 +265,7 @@ export function ItemLibrary() {
                 <span className="item-catalog-thumb item-catalog-thumb--empty" aria-hidden="true" />
               )}
               <span className="item-catalog-copy">
-                <span>{item.name}</span>
+                <ItemName name={item.name} rarity={item.rarity} />
                 <small>{formatCost(item.costCp)} · {item.weight} lb.</small>
               </span>
             </button>
@@ -203,7 +281,7 @@ export function ItemLibrary() {
           <>
             <div className="token-editor-header">
               <span className="ram-eyebrow">{CATEGORY_LABELS[selected.category]} details</span>
-              <span className="token-editor-header__actions">
+                  <span className="token-editor-header__actions">
                 <RamIconButton label={`Duplicate ${selected.name}`} onClick={() => duplicate(selected)}>
                   <Copy size={16} strokeWidth={1.5} />
                 </RamIconButton>
@@ -211,7 +289,8 @@ export function ItemLibrary() {
                   label={`Delete ${selected.name}`}
                   variant="danger"
                   onClick={() => {
-                    if (window.confirm(`Delete ${selected.name} from the item library?`)) {
+                    if (confirmDeletes) setDeleteTarget(selected);
+                    else {
                       deleteItem(selected.id);
                       setSelectedId("");
                     }
@@ -225,9 +304,27 @@ export function ItemLibrary() {
             <div className="item-editor-fields">
               <RamField label="Name" className="span-all">
                 <RamInput
+                  className={itemRarityClassName(selected.rarity)}
                   value={selected.name}
-                  onChange={(event) => updateItem(selected.id, { name: event.target.value })}
+                  onChange={(event) => patch( { name: event.target.value })}
                 />
+              </RamField>
+              <RamField label="Rarity">
+                <RamSelect
+                  className={itemRarityClassName(selected.rarity)}
+                  value={selected.rarity ?? "common"}
+                  onChange={(event) =>
+                    patch( {
+                      rarity: event.target.value as ItemRarity,
+                    })
+                  }
+                >
+                  {ITEM_RARITIES.map((rarity) => (
+                    <option value={rarity} key={rarity} style={itemRarityStyle(rarity)}>
+                      {ITEM_RARITY_LABELS[rarity]}
+                    </option>
+                  ))}
+                </RamSelect>
               </RamField>
               <RamField label="Value (cp)">
                 <RamInput
@@ -236,7 +333,7 @@ export function ItemLibrary() {
                   value={selected.costCp}
                   onChange={(event) => {
                     const costCp = Math.max(0, Number(event.target.value));
-                    updateItem(selected.id, { costCp, value: costCp / 100 });
+                    patch( { costCp, value: costCp / 100 });
                   }}
                 />
               </RamField>
@@ -247,7 +344,7 @@ export function ItemLibrary() {
                   step={0.1}
                   value={selected.weight}
                   onChange={(event) =>
-                    updateItem(selected.id, { weight: Math.max(0, Number(event.target.value)) })
+                    patch( { weight: Math.max(0, Number(event.target.value)) })
                   }
                 />
               </RamField>
@@ -270,7 +367,7 @@ export function ItemLibrary() {
                     <RamIconButton
                       label={`Remove ${selected.name} image`}
                       variant="danger"
-                      onClick={() => updateItem(selected.id, { image: undefined })}
+                      onClick={() => patch( { image: undefined })}
                     >
                       <X size={15} strokeWidth={1.5} />
                     </RamIconButton>
@@ -283,7 +380,7 @@ export function ItemLibrary() {
                   hidden
                   onChange={async (event) => {
                     const file = event.target.files?.[0];
-                    if (file) updateItem(selected.id, { image: await fileToDataURL(file) });
+                    if (file) patch( { image: await fileToDataURL(file) });
                     event.target.value = "";
                   }}
                 />
@@ -298,7 +395,7 @@ export function ItemLibrary() {
                     <RamSelect
                       value={selected.weaponClass}
                       onChange={(event) =>
-                        updateItem(selected.id, {
+                        patch( {
                           weaponClass: event.target.value as LibraryItem["weaponClass"],
                         })
                       }
@@ -311,7 +408,7 @@ export function ItemLibrary() {
                     <RamSelect
                       value={selected.weaponRange}
                       onChange={(event) =>
-                        updateItem(selected.id, {
+                        patch( {
                           weaponRange: event.target.value as LibraryItem["weaponRange"],
                         })
                       }
@@ -352,7 +449,7 @@ export function ItemLibrary() {
                     <RamSelect
                       value={selected.damageType}
                       onChange={(event) =>
-                        updateItem(selected.id, { damageType: event.target.value })
+                        patch( { damageType: event.target.value })
                       }
                     >
                       {DAMAGE_TYPES.map((type) => (
@@ -369,7 +466,7 @@ export function ItemLibrary() {
                     suggestions={PROPERTY_SUGGESTIONS}
                     ariaLabel="Weapon properties"
                     placeholder="Type or select a property…"
-                    onChange={(properties) => updateItem(selected.id, { properties })}
+                    onChange={(properties) => patch( { properties })}
                   />
                 </RamField>
               </div>
@@ -383,7 +480,7 @@ export function ItemLibrary() {
                     <RamSelect
                       value={selected.equipSlot}
                       onChange={(event) =>
-                        updateItem(selected.id, {
+                        patch( {
                           equipSlot: event.target.value as LibraryItem["equipSlot"],
                         })
                       }
@@ -400,7 +497,7 @@ export function ItemLibrary() {
                           min={0}
                           value={selected.armorClass}
                           onChange={(event) =>
-                            updateItem(selected.id, {
+                            patch( {
                               armorClass: Math.max(0, Number(event.target.value)),
                             })
                           }
@@ -410,7 +507,7 @@ export function ItemLibrary() {
                         <RamSelect
                           value={selected.armorDexterity}
                           onChange={(event) =>
-                            updateItem(selected.id, {
+                            patch( {
                               armorDexterity: event.target
                                 .value as LibraryItem["armorDexterity"],
                             })
@@ -427,7 +524,7 @@ export function ItemLibrary() {
                           min={0}
                           value={selected.strengthRequirement}
                           onChange={(event) =>
-                            updateItem(selected.id, {
+                            patch( {
                               strengthRequirement: Math.max(
                                 0,
                                 Number(event.target.value)
@@ -441,7 +538,7 @@ export function ItemLibrary() {
                           type="checkbox"
                           checked={selected.stealthDisadvantage}
                           onChange={(event) =>
-                            updateItem(selected.id, {
+                            patch( {
                               stealthDisadvantage: event.target.checked,
                             })
                           }
@@ -456,7 +553,7 @@ export function ItemLibrary() {
                         min={0}
                         value={selected.armorBonus}
                         onChange={(event) =>
-                          updateItem(selected.id, {
+                          patch( {
                             armorBonus: Math.max(0, Number(event.target.value)),
                           })
                         }
@@ -475,7 +572,7 @@ export function ItemLibrary() {
                     <RamSelect
                       value={selected.containerType}
                       onChange={(event) =>
-                        updateItem(selected.id, {
+                        patch( {
                           containerType: event.target
                             .value as LibraryItem["containerType"],
                         })
@@ -494,7 +591,7 @@ export function ItemLibrary() {
                       value={selected.contents}
                       placeholder="Water, oil, acid…"
                       onChange={(event) =>
-                        updateItem(selected.id, { contents: event.target.value })
+                        patch( { contents: event.target.value })
                       }
                     />
                   </RamField>
@@ -503,7 +600,7 @@ export function ItemLibrary() {
                       value={selected.capacity}
                       placeholder="1 pint"
                       onChange={(event) =>
-                        updateItem(selected.id, { capacity: event.target.value })
+                        patch( { capacity: event.target.value })
                       }
                     />
                   </RamField>
@@ -512,7 +609,7 @@ export function ItemLibrary() {
                       <RamSelect
                         value={selected.equipSlot === "gear" ? "gear" : "none"}
                         onChange={(event) =>
-                          updateItem(selected.id, {
+                          patch( {
                             equipSlot: event.target.value as "none" | "gear",
                           })
                         }
@@ -533,7 +630,7 @@ export function ItemLibrary() {
                         .map((item) => item.id)}
                       ariaLabel="Contained items"
                       placeholder="Select an item id; append :quantity if needed"
-                      onChange={(contains) => updateItem(selected.id, { contains })}
+                      onChange={(contains) => patch( { contains })}
                     />
                   </RamField>
                 )}
@@ -543,7 +640,7 @@ export function ItemLibrary() {
                     suggestions={[]}
                     ariaLabel="Granted actions"
                     placeholder="Type an action and press Enter…"
-                    onChange={(actions) => updateItem(selected.id, { actions })}
+                    onChange={(actions) => patch( { actions })}
                   />
                 </RamField>
               </div>
@@ -554,7 +651,7 @@ export function ItemLibrary() {
                 value={selected.description}
                 placeholder="Concrete appearance, purpose, and mechanical use…"
                 onChange={(event) =>
-                  updateItem(selected.id, { description: event.target.value })
+                  patch( { description: event.target.value })
                 }
               />
             </RamField>
@@ -566,5 +663,18 @@ export function ItemLibrary() {
         )}
       </div>
     </div>
+    <RamConfirmDialog
+      open={Boolean(deleteTarget)}
+      title={`Delete ${deleteTarget?.name ?? "item"}?`}
+      description="This item will be permanently removed from the item library."
+      confirmLabel="Delete"
+      onConfirm={() => {
+        if (!deleteTarget) return;
+        deleteItem(deleteTarget.id);
+        setSelectedId("");
+      }}
+      onClose={() => setDeleteTarget(undefined)}
+    />
+    </>
   );
 }

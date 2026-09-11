@@ -20,19 +20,18 @@ interface Star {
   y: number;
   size: number;
   phase: number;
-  speed: number;
+  twinklePeriod: number;
+  twinkleDuration: number;
   r: number;
   g: number;
   b: number;
   baseAlpha: number;
   twinkle: number;
-  spark: number;
-  spike: boolean;
 }
 
 const LOOKS: Record<EnvironmentLighting, LightingLook> = {
   dawn: {
-    ground: "52, 42, 50",
+    ground: "64, 53, 78",
     washTop: "148, 108, 122",
     washBottom: "86, 62, 78",
     washAlpha: 0.16,
@@ -41,12 +40,12 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     overlay: "168, 122, 132",
     overlayAlpha: 0.1,
     lift: 0,
-    stars: 0.34,
+    stars: 0.72,
     fog: 0.7,
     fogColor: "150, 158, 185",
   },
   sunrise: {
-    ground: "78, 60, 48",
+    ground: "157, 111, 88",
     washTop: "186, 132, 88",
     washBottom: "128, 78, 58",
     washAlpha: 0.18,
@@ -55,12 +54,12 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     overlay: "199, 170, 98",
     overlayAlpha: 0.14,
     lift: 0.03,
-    stars: 0.08,
+    stars: 0.34,
     fog: 0.32,
     fogColor: "168, 150, 132",
   },
   morning: {
-    ground: "92, 94, 106",
+    ground: "116, 153, 188",
     washTop: "168, 176, 196",
     washBottom: "186, 168, 140",
     washAlpha: 0.08,
@@ -69,12 +68,12 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     overlay: "188, 193, 204",
     overlayAlpha: 0.08,
     lift: 0.04,
-    stars: 0,
+    stars: 0.28,
     fog: 0.18,
     fogColor: "150, 158, 185",
   },
   noon: {
-    ground: "112, 114, 126",
+    ground: "105, 154, 198",
     washTop: "150, 158, 185",
     washBottom: "150, 158, 185",
     washAlpha: 0.04,
@@ -88,7 +87,7 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     fogColor: "150, 158, 185",
   },
   midday: {
-    ground: "156, 156, 162",
+    ground: "130, 174, 210",
     washTop: "220, 218, 208",
     washBottom: "210, 206, 196",
     washAlpha: 0.05,
@@ -111,7 +110,7 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     overlay: "180, 110, 78",
     overlayAlpha: 0.12,
     lift: 0,
-    stars: 0.12,
+    stars: 0.85,
     fog: 0.22,
     fogColor: "128, 96, 112",
   },
@@ -125,31 +124,31 @@ const LOOKS: Record<EnvironmentLighting, LightingLook> = {
     overlay: "120, 130, 164",
     overlayAlpha: 0.08,
     lift: 0,
-    stars: 0.5,
+    stars: 0.95,
     fog: 0.28,
     fogColor: "120, 130, 164",
   },
   night: {
-    ground: "18, 20, 32",
-    washTop: "28, 36, 64",
-    washBottom: "12, 16, 28",
-    washAlpha: 0.14,
+    ground: "9, 11, 20",
+    washTop: "20, 27, 51",
+    washBottom: "7, 9, 17",
+    washAlpha: 0.15,
     multiply: "10, 14, 26",
-    multiplyAlpha: 0.28,
+    multiplyAlpha: 0.48,
     overlay: "120, 130, 164",
     overlayAlpha: 0,
     lift: 0,
-    stars: 0.86,
+    stars: 1,
     fog: 0.36,
     fogColor: "88, 98, 128",
   },
   midnight: {
-    ground: "8, 10, 16",
-    washTop: "14, 18, 36",
-    washBottom: "6, 8, 16",
-    washAlpha: 0.16,
+    ground: "4, 5, 10",
+    washTop: "9, 12, 27",
+    washBottom: "3, 4, 9",
+    washAlpha: 0.26,
     multiply: "6, 8, 16",
-    multiplyAlpha: 0.36,
+    multiplyAlpha: 0.62,
     overlay: "88, 98, 128",
     overlayAlpha: 0,
     lift: 0,
@@ -185,17 +184,17 @@ function wrap01(value: number) {
   return value - Math.floor(value);
 }
 
-const STAR_COUNT = 680;
+const STAR_COUNT = 3800;
 const stars: Star[] = Array.from({ length: STAR_COUNT }, (_, i) => {
   const place = hash(i, 2.17);
   let x: number;
   let y: number;
-  if (place < 0.46) {
+  if (place < 0.3) {
     const along = hash(i, 7.1);
     const spread = (hash(i, 1.9) - 0.5) * (0.045 + hash(i, 5.5) * 0.16);
     x = along * 1.08 - 0.04;
     y = 0.08 + along * 0.2 + spread;
-  } else if (place < 0.7) {
+  } else if (place < 0.45) {
     const cluster = CLUSTERS[Math.floor(hash(i, 8.3) * CLUSTERS.length)];
     const ang = hash(i, 6.2) * Math.PI * 2;
     const rad = Math.pow(hash(i, 3.9), 0.62) * cluster.s;
@@ -210,20 +209,19 @@ const stars: Star[] = Array.from({ length: STAR_COUNT }, (_, i) => {
   const warmth = hash(i, 3.71);
   const { r, g, b } = starColor(warmth);
   const twinkleRoll = hash(i, 11.17);
-  const twinkles = twinkleRoll > 0.88;
+  const twinkles = twinkleRoll > 0.12;
   return {
     x: wrap01(x),
     y: Math.max(0, Math.min(0.9, y)),
-    size: 0.9 + mag * 4.4,
-    phase: hash(i, 12.9898) * Math.PI * 2,
-    speed: 0.00028 + hash(i, 15.2) * 0.0007,
+    size: 0.7 + mag * 1.6,
+    phase: hash(i, 12.9898) * 26_000,
+    twinklePeriod: 12_000 + hash(i, 15.2) * 16_000,
+    twinkleDuration: 5_000 + hash(i, 14.6) * 5_000,
     r,
     g,
     b,
-    baseAlpha: 0.18 + mag * 0.82,
-    twinkle: twinkles ? 0.04 + hash(i, 13.3) * 0.08 : 0,
-    spark: twinkles && hash(i, 17.9) > 0.78 ? 0.12 + hash(i, 19.1) * 0.16 : 0,
-    spike: mag > 0.82,
+    baseAlpha: 0.28 + mag * 0.58,
+    twinkle: twinkles ? 1.6 + hash(i, 13.3) * 2.1 : 0,
   };
 });
 
@@ -344,19 +342,8 @@ function paintStar(
   const x = star.x * width;
   const y = star.y * height;
   const size = Math.max(1, star.size);
-  if (size >= 2.2) {
-    ctx.fillStyle = `rgba(${star.r}, ${star.g}, ${star.b}, ${alpha * 0.18})`;
-    const glow = size * 2.1;
-    ctx.fillRect(x - glow * 0.5, y - glow * 0.5, glow, glow);
-  }
   ctx.fillStyle = `rgba(${star.r}, ${star.g}, ${star.b}, ${alpha})`;
   ctx.fillRect(x - size * 0.5, y - size * 0.5, size, size);
-  if (!star.spike || size < 2.8) return;
-  const spike = size * (0.85 + alpha * 0.4);
-  ctx.globalAlpha = alpha * 0.32;
-  ctx.fillRect(x - spike, y - 0.5, spike * 2, 1);
-  ctx.fillRect(x - 0.5, y - spike, 1, spike * 2);
-  ctx.globalAlpha = 1;
 }
 
 function drawMilkyWay(ctx: CanvasRenderingContext2D, width: number, height: number) {
@@ -373,17 +360,36 @@ function drawMilkyWay(ctx: CanvasRenderingContext2D, width: number, height: numb
 }
 
 function starAlpha(star: Star, lookStars: number, now: number, reduced: boolean) {
-  let alpha = star.baseAlpha * lookStars;
-  if (reduced || star.twinkle <= 0) return alpha;
-  alpha *= 1 + star.twinkle * Math.sin(now * star.speed + star.phase);
-  if (star.spark > 0) {
-    const spark = Math.sin(now * star.speed * 1.7 + star.phase * 2.1);
-    if (spark > 0.988) {
-      const peak = (spark - 0.988) / 0.012;
-      alpha += peak * peak * star.spark * lookStars;
-    }
+  const base = star.baseAlpha * lookStars;
+  if (reduced || star.twinkle <= 0) return base;
+  const cycle = (now + star.phase) % star.twinklePeriod;
+  if (cycle >= star.twinkleDuration) return base;
+  const progress = cycle / star.twinkleDuration;
+  const envelope = Math.sin(progress * Math.PI) ** 2;
+  const shimmer = 0.65 + Math.sin(progress * Math.PI * 2) * 0.35;
+  return Math.min(1, base * (1 + shimmer * envelope * star.twinkle));
+}
+
+function paintStaticStars(
+  ctx: CanvasRenderingContext2D,
+  list: Star[],
+  width: number,
+  height: number
+) {
+  const image = ctx.createImageData(width, height);
+  for (const star of list) {
+    const x = Math.min(width - 1, Math.max(0, Math.round(star.x * width)));
+    const y = Math.min(height - 1, Math.max(0, Math.round(star.y * height)));
+    const coverage = Math.min(1, Math.max(0.34, star.size * star.size));
+    const alpha = Math.round(star.baseAlpha * coverage * 255);
+    const index = (y * width + x) * 4;
+    if (alpha <= image.data[index + 3]) continue;
+    image.data[index] = star.r;
+    image.data[index + 1] = star.g;
+    image.data[index + 2] = star.b;
+    image.data[index + 3] = alpha;
   }
-  return Math.min(1, alpha);
+  ctx.putImageData(image, 0, 0);
 }
 
 function rebuildStarLayer(width: number, height: number, reduced: boolean) {
@@ -391,11 +397,11 @@ function rebuildStarLayer(width: number, height: number, reduced: boolean) {
   if (starLayer.width !== width) starLayer.width = Math.max(1, width);
   if (starLayer.height !== height) starLayer.height = Math.max(1, height);
   else starLayerCtx.clearRect(0, 0, width, height);
-  drawMilkyWay(starLayerCtx, width, height);
   const list = reduced ? stars : stillStars;
-  for (const star of list) {
-    paintStar(starLayerCtx, star, width, height, star.baseAlpha);
-  }
+  paintStaticStars(starLayerCtx, list, width, height);
+  starLayerCtx.globalCompositeOperation = "destination-over";
+  drawMilkyWay(starLayerCtx, width, height);
+  starLayerCtx.globalCompositeOperation = "source-over";
   packedW = width;
   packedH = height;
   packedReduced = reduced;
@@ -408,11 +414,12 @@ function drawFog(
   look: LightingLook
 ) {
   if (look.fog <= 0.02) return;
-  const band = ctx.createLinearGradient(0, height * 0.68, 0, height);
+  const band = ctx.createLinearGradient(0, height * 0.55, 0, height);
   band.addColorStop(0, `rgba(${look.fogColor}, 0)`);
-  band.addColorStop(1, `rgba(${look.fogColor}, ${0.1 * look.fog})`);
+  band.addColorStop(0.72, `rgba(${look.fogColor}, ${0.018 * look.fog})`);
+  band.addColorStop(1, `rgba(${look.fogColor}, ${0.06 * look.fog})`);
   ctx.fillStyle = band;
-  ctx.fillRect(0, height * 0.68, width, height * 0.32);
+  ctx.fillRect(0, height * 0.55, width, height * 0.45);
 }
 
 /** Night sky only. Drawn behind maps and tokens. */

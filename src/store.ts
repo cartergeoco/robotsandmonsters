@@ -1,19 +1,25 @@
 import { create } from "zustand";
-import { createJSONStorage, persist } from "zustand/middleware";
+import { persist } from "zustand/middleware";
 import {
-  campaignStateStorage,
+  createCampaignPersistStorage,
+  campaignStorageKey,
   markCampaignStorageReady,
   readSceneView,
+  setCampaignWriteDelay,
   writeSceneView,
 } from "./persistStorage";
 import type {
+  ActionSlot,
   AISettings,
   AreaPresence,
+  Combatant,
+  CombatState,
   CreatureMechanics,
   Environment,
   EnvironmentLighting,
   EnvironmentTrack,
   EnvironmentWeather,
+  GameplaySettings,
   LightingTransition,
   WeatherTransition,
   LibraryItem,
@@ -32,6 +38,7 @@ import type {
   StatusEffect,
   TokenCell,
   TokenFloater,
+  TokenIntent,
   TokenKind,
   UISettings,
 } from "./types";
@@ -39,6 +46,7 @@ import {
   CREATURE_SHEEN_MS,
   DEFAULT_ABILITIES,
   DEFAULT_AI_SETTINGS,
+  DEFAULT_GAMEPLAY_SETTINGS,
   DEFAULT_SESSION_MEMORY,
   DEFAULT_UI_SETTINGS,
   DEFAULT_VISUAL_SCALE,
@@ -51,6 +59,7 @@ import {
   normalizeDeathSaves,
   lightingCyclePath,
   normalizeItemRarity,
+  normalizeGameplaySettings,
   normalizeLighting,
   normalizeWeather,
   STATUS_EFFECT_PRESETS,
@@ -73,10 +82,34 @@ import {
 import { PREMADE_LIBRARY_ITEMS } from "./itemCatalog";
 import { PREMADE_RULES } from "./ruleCatalog";
 import { normalizeAISettings } from "./aiProviders";
-import { applyHpChange, creatureUsesDeathSaves } from "./deathSaves";
+import { applyHpChange, creatureUsesDeathSaves, isDead } from "./deathSaves";
+import { applyFullRest, applyShortRest, classHitDie } from "./rests";
 import { resolveSceneTriggers } from "./saves";
+import {
+  activeCombatant,
+  advanceTurn,
+  combatantSpeed,
+  createCombatant,
+  focusCreature,
+  insertInOrder,
+  movementBudget,
+  normalizeCombat,
+  removeFromOrder,
+  resetTurnBudget,
+  sortCombatants,
+} from "./combat";
+import { applyDeathSaveRoll, isDying } from "./deathSaves";
+import { d20FromResult, requestD20Roll } from "./diceRolls";
+import { distanceFeet } from "./perception";
 
 const uid = () => crypto.randomUUID();
+const boundedLog = (entries: LogEntry[], limit: number) =>
+  entries.slice(-Math.max(100, limit || DEFAULT_UI_SETTINGS.maxConsoleEntries));
+const normalizeTokenIntent = (intent: TokenIntent): TokenIntent => ({
+  ...intent,
+  autonomy: intent.autonomy === "propose" ? "propose" : "announce",
+  status: "pending",
+});
 const LEGACY_PREMADE_ITEM_IDS = [
   "item-dagger",
   "item-shortbow",
@@ -120,6 +153,10 @@ const copyMapToken = (token: MapToken, freshIds = false): MapToken => ({
   ruleChoices: Object.fromEntries(
     Object.entries(token.ruleChoices ?? {}).map(([key, values]) => [key, [...values]])
   ),
+  abilityImprovements: (token.abilityImprovements ?? []).map((improvement) => ({
+    ...improvement,
+    increases: { ...improvement.increases },
+  })),
   inventory: token.inventory.map((item) => ({
     ...item,
     id: freshIds ? uid() : item.id,
@@ -138,6 +175,7 @@ const cloneEnvironment = (environment: Environment): Environment => ({
   background: environment.background ? { ...environment.background } : null,
   music: cloneEnvironmentTrack(environment.music),
   ambience: cloneEnvironmentTrack(environment.ambience),
+  battleMusic: cloneEnvironmentTrack(environment.battleMusic),
   tokens: environment.tokens.map(cloneMapToken),
   saveAreas: (environment.saveAreas ?? []).map(cloneSaveArea),
 });
@@ -269,6 +307,26 @@ function displayedLighting(
 
 const cloneRule = (rule: RuleDefinition): RuleDefinition => ({
   ...rule,
+  abilityScoreImprovementLevels: [...(rule.abilityScoreImprovementLevels ?? [])],
+  resourceTracks: (rule.resourceTracks ?? []).map((track) => ({
+    ...track,
+    values: track.values.map((value) => ({ ...value })),
+  })),
+  spellcasting: rule.spellcasting
+    ? {
+        ...rule.spellcasting,
+        slotsByLevel: rule.spellcasting.slotsByLevel.map((row) => [...row]),
+        slotLevels: rule.spellcasting.slotLevels
+          ? [...rule.spellcasting.slotLevels]
+          : undefined,
+        cantripsKnown: rule.spellcasting.cantripsKnown
+          ? [...rule.spellcasting.cantripsKnown]
+          : undefined,
+        spellsKnown: rule.spellcasting.spellsKnown
+          ? [...rule.spellcasting.spellsKnown]
+          : undefined,
+      }
+    : null,
   abilityBonuses: { ...rule.abilityBonuses },
   saveBonuses: { ...rule.saveBonuses },
   saveProficiencies: [...rule.saveProficiencies],
@@ -281,11 +339,24 @@ const cloneRule = (rule: RuleDefinition): RuleDefinition => ({
   damageImmunities: [...rule.damageImmunities],
   conditionImmunities: [...rule.conditionImmunities],
   specialActions: [...rule.specialActions],
-  features: rule.features.map((feature) => ({ ...feature })),
+  features: rule.features.map((feature) => ({
+    ...feature,
+    grants: feature.grants
+      ? {
+          expertise: feature.grants.expertise
+            ? [...feature.grants.expertise]
+            : undefined,
+          halfProficiencyAbilities: feature.grants.halfProficiencyAbilities
+            ? [...feature.grants.halfProficiencyAbilities]
+            : undefined,
+        }
+      : undefined,
+  })),
   unarmoredAcAbilities: [...rule.unarmoredAcAbilities],
   startingKit: (rule.startingKit ?? []).map((entry) => ({ ...entry })),
   choices: (rule.choices ?? []).map((choice) => ({
     ...choice,
+    levelCounts: choice.levelCounts?.map((entry) => ({ ...entry })),
     options: [...choice.options],
   })),
 });
@@ -357,6 +428,7 @@ interface RAMState {
   saveAreas: SaveArea[];
   areaPresence: AreaPresence[];
   tokenFloaters: TokenFloater[];
+  tokenIntents: TokenIntent[];
   creatureSheens: CreatureSheen[];
   selectedSaveAreaId: string | null;
   deletedLibraryItemIds: string[];
@@ -366,6 +438,11 @@ interface RAMState {
   weather: EnvironmentWeather;
   music: EnvironmentTrack | null;
   ambience: EnvironmentTrack | null;
+  battleMusic: EnvironmentTrack | null;
+  /** Campaign-wide fallback used when the scene has no battle track. */
+  defaultBattleMusic: EnvironmentTrack | null;
+  /** Null outside of battle; presence of this slice is what "battle mode" means. */
+  combat: CombatState | null;
   activeEnvironmentId: string | null;
   mapCamera: MapCamera | null;
   sceneTransition: SceneTransition | null;
@@ -375,6 +452,7 @@ interface RAMState {
   /** Digest of console history that scrolled out of the verbatim window. */
   memory: SessionMemory;
   settings: AISettings;
+  gameplaySettings: GameplaySettings;
   uiSettings: UISettings;
   /** PC ids with an in-flight AI request. */
   thinking: string[];
@@ -392,14 +470,21 @@ interface RAMState {
   addPC: () => string;
   duplicatePC: (id: string) => void;
   levelUpParty: () => void;
+  shortRestParty: () => void;
+  fullRestParty: () => void;
   updatePC: (id: string, patch: Partial<PC>) => void;
   deletePC: (id: string) => void;
   selectPC: (id: string | null) => void;
   moveCreature: (id: string, isPC: boolean, x: number, y: number) => void;
+  moveCreatures: (
+    moves: Array<{ id: string; isPC: boolean; x: number; y: number }>
+  ) => void;
 
   placeToken: (blueprint: TokenBlueprint) => void;
   updateToken: (id: string, patch: Partial<MapToken>) => void;
   addTokenFloater: (floater: Omit<TokenFloater, "id" | "bornAt">) => void;
+  setPCIntent: (intent: Omit<TokenIntent, "id" | "createdAt" | "status">) => void;
+  clearPCIntent: (creatureId: string, intentId?: string) => void;
   duplicateToken: (id: string) => void;
   deleteToken: (id: string) => void;
   addTokenBlueprint: (blueprint: TokenBlueprint) => void;
@@ -426,6 +511,8 @@ interface RAMState {
   setWeather: (weather: EnvironmentWeather) => void;
   setMusic: (music: EnvironmentTrack | null) => void;
   setAmbience: (ambience: EnvironmentTrack | null) => void;
+  setBattleMusic: (battleMusic: EnvironmentTrack | null) => void;
+  setDefaultBattleMusic: (battleMusic: EnvironmentTrack | null) => void;
   setMapCamera: (camera: MapCamera) => void;
   clearSceneTransition: () => void;
   clearLightingTransition: () => void;
@@ -447,7 +534,21 @@ interface RAMState {
   setMemoryBusy: (busy: boolean) => void;
   clearMemory: () => void;
 
+  startCombat: (
+    entries: Array<{ id: string; isPC: boolean; d20: number; dexMod: number }>
+  ) => void;
+  endCombat: () => void;
+  nextTurn: () => void;
+  prevTurn: () => void;
+  addCombatant: (id: string, isPC: boolean, d20: number, dexMod: number) => void;
+  removeCombatant: (id: string) => void;
+  setInitiative: (id: string, initiative: number) => void;
+  spendActionSlot: (id: string, slot: ActionSlot, spent?: boolean) => void;
+  toggleDash: (id: string) => void;
+  rollDeathSave: (id: string, isPC: boolean, d20: number) => void;
+
   setSettings: (patch: Partial<AISettings>) => void;
+  setGameplaySettings: (patch: Partial<GameplaySettings>) => void;
   setUISettings: (patch: Partial<UISettings>) => void;
   setSettingsOpen: (open: boolean) => void;
   setActiveView: (view: "grid" | "world-map") => void;
@@ -465,6 +566,7 @@ type PersistedRAMState = Pick<
   | "environments"
   | "saveAreas"
   | "areaPresence"
+  | "tokenIntents"
   | "deletedLibraryItemIds"
   | "deletedRuleDefinitionIds"
   | "background"
@@ -472,20 +574,26 @@ type PersistedRAMState = Pick<
   | "weather"
   | "music"
   | "ambience"
+  | "battleMusic"
+  | "defaultBattleMusic"
+  | "combat"
   | "activeEnvironmentId"
   | "mapCamera"
   | "activeView"
   | "log"
   | "memory"
   | "settings"
+  | "gameplaySettings"
   | "uiSettings"
 >;
 
 type LegacyPersistedRAMState = Omit<
   PersistedRAMState,
   | "settings"
+  | "gameplaySettings"
   | "uiSettings"
   | "memory"
+  | "tokenIntents"
   | "customTokenBlueprints"
   | "customLibraryItems"
   | "ruleDefinitions"
@@ -499,6 +607,8 @@ type LegacyPersistedRAMState = Omit<
   | "activeView"
 > & {
   settings: Partial<AISettings>;
+  gameplaySettings?: Partial<GameplaySettings>;
+  tokenIntents?: TokenIntent[];
   uiSettings?: Partial<UISettings>;
   memory?: Partial<SessionMemory>;
   customTokenBlueprints?: TokenBlueprint[];
@@ -513,6 +623,9 @@ type LegacyPersistedRAMState = Omit<
   weather?: EnvironmentWeather;
   music?: EnvironmentTrack | null;
   ambience?: EnvironmentTrack | null;
+  battleMusic?: EnvironmentTrack | null;
+  defaultBattleMusic?: EnvironmentTrack | null;
+  combat?: CombatState | null;
   activeEnvironmentId?: string | null;
   mapCamera?: MapCamera | null;
   activeView?: "grid" | "world-map";
@@ -530,6 +643,104 @@ export const useRAM = create<RAMState>()(
           mapCamera: state.mapCamera,
           activeView: state.activeView,
         });
+      };
+
+      const creatureById = (
+        id: string,
+        isPC: boolean
+      ): (PC | MapToken) | undefined => {
+        const state = get();
+        return isPC
+          ? state.pcs.find((pc) => pc.id === id)
+          : state.tokens.find((token) => token.id === id);
+      };
+
+      const combatantIsDead = (combatant: Combatant): boolean => {
+        const creature = creatureById(combatant.id, combatant.isPC);
+        return !creature || isDead(creature);
+      };
+
+      const combatantName = (combatant: Combatant): string => {
+        const creature = creatureById(combatant.id, combatant.isPC);
+        if (!creature) return "Unknown";
+        return "givenName" in creature && creature.givenName
+          ? creature.givenName
+          : creature.name;
+      };
+
+      const logCombat = (text: string) => {
+        get().addLog({ role: "system", author: "Combat", text });
+      };
+
+      /** Refreshes every budget so a fight always opens on a clean first turn. */
+      const openingOrder = (combatants: Combatant[]): Combatant[] =>
+        sortCombatants(combatants).map(resetTurnBudget);
+
+      /**
+       * Called whenever the spotlight moves: logs the turn, pans the map, and
+       * settles a dying combatant's death save when the GM asked for that.
+       */
+      const announceTurn = () => {
+        const state = get();
+        const active = activeCombatant(state.combat);
+        if (!active || !state.combat) return;
+        const creature = creatureById(active.id, active.isPC);
+        if (!creature) return;
+        logCombat(
+          `Round ${state.combat.round} — ${combatantName(active)}'s turn.`
+        );
+        if (state.uiSettings.motion !== "reduced") focusCreature(active.id);
+        if (
+          state.gameplaySettings.autoDeathSaves &&
+          state.gameplaySettings.combatRules !== "off" &&
+          isDying(creature) &&
+          creatureUsesDeathSaves(creature)
+        ) {
+          requestD20Roll((result) => {
+            get().rollDeathSave(active.id, active.isPC, d20FromResult(result));
+          });
+        }
+      };
+
+      const combatantBudget = (combatant: Combatant) => {
+        const creature = creatureById(combatant.id, combatant.isPC);
+        if (!creature) return null;
+        const state = get();
+        return movementBudget(
+          combatant,
+          combatantSpeed(creature, state.ruleDefinitions, state.customLibraryItems)
+        );
+      };
+
+      /**
+       * Prices one leg of a move against the active combatant's remaining
+       * speed. Only the creature whose turn it is spends movement; strict mode
+       * refuses the leg outright rather than dropping the token mid-path.
+       */
+      const priceMovement = (
+        active: Combatant | null,
+        creature: PC | MapToken,
+        move: { id: string; x: number; y: number },
+        strict: boolean
+      ): { feet: number; blocked: boolean } => {
+        if (!active || active.id !== move.id) return { feet: 0, blocked: false };
+        const feet = distanceFeet(creature, {
+          x: move.x,
+          y: move.y,
+          width: creature.width,
+          height: creature.height,
+          bounds: creature.bounds,
+        });
+        if (!Number.isFinite(feet)) return { feet: 0, blocked: false };
+        if (!strict) return { feet, blocked: false };
+        const budget = combatantBudget(active);
+        if (budget && feet > budget.remaining) {
+          logCombat(
+            `${combatantName(active)} cannot move ${feet} ft — only ${budget.remaining} ft left this turn.`
+          );
+          return { feet: 0, blocked: true };
+        }
+        return { feet, blocked: false };
       };
 
       const applySceneTriggers = () => {
@@ -552,14 +763,14 @@ export const useRAM = create<RAMState>()(
           tokenFloaters: result.tokenFloaters,
           creatureSheens: appendCreatureSheens(state.creatureSheens, result.statusSheens),
           log: result.logs.length
-            ? [
+            ? boundedLog([
                 ...state.log,
                 ...result.logs.map((entry) => ({
                   ...entry,
                   id: uid(),
                   ts: Date.now(),
                 })),
-              ]
+              ], state.uiSettings.maxConsoleEntries)
             : state.log,
         });
       };
@@ -575,6 +786,7 @@ export const useRAM = create<RAMState>()(
       saveAreas: [],
       areaPresence: [],
       tokenFloaters: [],
+      tokenIntents: [],
       creatureSheens: [],
       selectedSaveAreaId: null,
       deletedLibraryItemIds: [],
@@ -584,6 +796,9 @@ export const useRAM = create<RAMState>()(
       weather: "clear",
       music: null,
       ambience: null,
+      battleMusic: null,
+      defaultBattleMusic: null,
+      combat: null,
       activeEnvironmentId: null,
       mapCamera: null,
       sceneTransition: null,
@@ -600,6 +815,7 @@ export const useRAM = create<RAMState>()(
       ],
       memory: { ...DEFAULT_SESSION_MEMORY, bullets: [] },
       settings: { ...DEFAULT_AI_SETTINGS },
+      gameplaySettings: { ...DEFAULT_GAMEPLAY_SETTINGS },
       uiSettings: { ...DEFAULT_UI_SETTINGS },
       thinking: [],
       memoryBusy: false,
@@ -634,6 +850,7 @@ export const useRAM = create<RAMState>()(
             subclass: "",
             backgroundName: "",
             ruleChoices: {},
+            abilityImprovements: [],
             creatureType: "humanoid",
             size: "medium",
             level: 1,
@@ -652,6 +869,7 @@ export const useRAM = create<RAMState>()(
             alignment: "True Neutral",
             personality:
               "Brave but cautious. Speaks plainly and acts decisively when the party hesitates.",
+            goal: "",
             knowledge: "",
             color: PC_COLORS[n % PC_COLORS.length],
             visualScale: DEFAULT_VISUAL_SCALE,
@@ -685,6 +903,10 @@ export const useRAM = create<RAMState>()(
           ruleChoices: Object.fromEntries(
             Object.entries(source.ruleChoices ?? {}).map(([key, values]) => [key, [...values]])
           ),
+          abilityImprovements: (source.abilityImprovements ?? []).map((improvement) => ({
+            ...improvement,
+            increases: { ...improvement.increases },
+          })),
           skills: source.skills.map((skill) => ({ ...skill, id: uid() })),
           traits: source.traits.map((trait) => ({ ...trait, id: uid() })),
           features: source.features.map((feature) => ({ ...feature, id: uid() })),
@@ -700,8 +922,11 @@ export const useRAM = create<RAMState>()(
 
       levelUpParty: () => {
         const state = get();
-        if (state.pcs.length === 0) return;
+        const levelingPcs = state.pcs.filter((pc) => pc.level < 20);
+        if (levelingPcs.length === 0) return;
+        const levelingIds = new Set(levelingPcs.map((pc) => pc.id));
         const nextPcs = state.pcs.map((pc) => {
+          if (!levelingIds.has(pc.id)) return pc;
           const next = withCalculatedStats(
             { ...pc, level: pc.level + 1 },
             state.ruleDefinitions,
@@ -714,13 +939,79 @@ export const useRAM = create<RAMState>()(
           pcs: nextPcs,
           creatureSheens: appendCreatureSheens(
             state.creatureSheens,
-            nextPcs.map((pc) => ({ creatureId: pc.id, kind: "levelup" as const }))
+            nextPcs
+              .filter((pc) => levelingIds.has(pc.id))
+              .map((pc) => ({ creatureId: pc.id, kind: "levelup" as const }))
           ),
           tokenFloaters: appendTokenFloaters(
             state.tokenFloaters,
-            nextPcs.map((pc) =>
-              creatureFeedbackFloater(pc.id, "levelup", "LEVEL UP", `Lv ${pc.level}`)
-            )
+            nextPcs
+              .filter((pc) => levelingIds.has(pc.id))
+              .map((pc) =>
+                creatureFeedbackFloater(pc.id, "levelup", "LEVEL UP", `Lv ${pc.level}`)
+              )
+          ),
+        });
+      },
+
+      shortRestParty: () => {
+        const state = get();
+        if (state.pcs.length === 0) return;
+        const nextPcs = state.pcs.map((pc) =>
+          applyShortRest(pc, classHitDie(pc, state.ruleDefinitions))
+        );
+        set({
+          pcs: nextPcs,
+          creatureSheens: appendCreatureSheens(
+            state.creatureSheens,
+            nextPcs.map((pc) => ({ creatureId: pc.id, kind: "buff" as const }))
+          ),
+          tokenFloaters: appendTokenFloaters(
+            state.tokenFloaters,
+            nextPcs.map((pc) => creatureFeedbackFloater(pc.id, "buff", "SHORT REST"))
+          ),
+          log: boundedLog(
+            [
+              ...state.log,
+              {
+                id: uid(),
+                ts: Date.now(),
+                role: "system",
+                author: "Rest",
+                text: "The party takes a short rest.",
+              },
+            ],
+            state.uiSettings.maxConsoleEntries
+          ),
+        });
+      },
+
+      fullRestParty: () => {
+        const state = get();
+        if (state.pcs.length === 0) return;
+        const nextPcs = state.pcs.map((pc) => applyFullRest(pc));
+        set({
+          pcs: nextPcs,
+          creatureSheens: appendCreatureSheens(
+            state.creatureSheens,
+            nextPcs.map((pc) => ({ creatureId: pc.id, kind: "buff" as const }))
+          ),
+          tokenFloaters: appendTokenFloaters(
+            state.tokenFloaters,
+            nextPcs.map((pc) => creatureFeedbackFloater(pc.id, "buff", "FULL REST"))
+          ),
+          log: boundedLog(
+            [
+              ...state.log,
+              {
+                id: uid(),
+                ts: Date.now(),
+                role: "system",
+                author: "Rest",
+                text: "The party takes a full rest.",
+              },
+            ],
+            state.uiSettings.maxConsoleEntries
           ),
         });
       },
@@ -749,22 +1040,78 @@ export const useRAM = create<RAMState>()(
       },
 
       moveCreature: (id, isPC, x, y) => {
-        if (isPC) {
-          const pc = get().pcs.find((entry) => entry.id === id);
-          if (!pc || (pc.x === x && pc.y === y)) return;
-          set({
-            pcs: get().pcs.map((entry) => (entry.id === id ? { ...entry, x, y } : entry)),
-          });
-        } else {
-          const token = get().tokens.find((entry) => entry.id === id);
-          if (!token || (token.x === x && token.y === y)) return;
-          set({
-            tokens: get().tokens.map((entry) =>
-              entry.id === id ? { ...entry, x, y } : entry
-            ),
-          });
+        get().moveCreatures([{ id, isPC, x, y }]);
+      },
+
+      moveCreatures: (moves) => {
+        if (!moves.length) return;
+        const combatRules = get().gameplaySettings.combatRules;
+        const combat = get().combat;
+        const active = combatRules === "off" ? null : activeCombatant(combat);
+        const strict = combatRules === "strict";
+        let pcs = get().pcs;
+        let tokens = get().tokens;
+        let pcsChanged = false;
+        let tokensChanged = false;
+        let spentFeet = 0;
+        for (const move of moves) {
+          if (move.isPC) {
+            const index = pcs.findIndex((entry) => entry.id === move.id);
+            if (index < 0) continue;
+            const pc = pcs[index];
+            if (pc.x === move.x && pc.y === move.y) continue;
+            const priced = priceMovement(active, pc, move, strict);
+            if (priced.blocked) continue;
+            spentFeet += priced.feet;
+            if (!pcsChanged) {
+              pcs = pcs.slice();
+              pcsChanged = true;
+            }
+            pcs[index] = { ...pc, x: move.x, y: move.y };
+          } else {
+            const index = tokens.findIndex((entry) => entry.id === move.id);
+            if (index < 0) continue;
+            const token = tokens[index];
+            if (token.x === move.x && token.y === move.y) continue;
+            const priced = priceMovement(active, token, move, strict);
+            if (priced.blocked) continue;
+            spentFeet += priced.feet;
+            if (!tokensChanged) {
+              tokens = tokens.slice();
+              tokensChanged = true;
+            }
+            tokens[index] = { ...token, x: move.x, y: move.y };
+          }
         }
-        applySceneTriggers();
+        if (!pcsChanged && !tokensChanged) return;
+        const spending = active && combat && spentFeet > 0;
+        set({
+          ...(pcsChanged ? { pcs } : {}),
+          ...(tokensChanged ? { tokens } : {}),
+          ...(spending
+            ? {
+                combat: {
+                  ...combat,
+                  combatants: combat.combatants.map((entry) =>
+                    entry.id === active.id
+                      ? { ...entry, movementUsed: entry.movementUsed + spentFeet }
+                      : entry
+                  ),
+                },
+              }
+            : {}),
+        });
+        if (spending && combatRules === "advisory") {
+          const budget = combatantBudget(activeCombatant(get().combat)!);
+          if (budget && budget.over > 0 && budget.over <= spentFeet) {
+            logCombat(
+              `${combatantName(active)} has moved ${budget.used} ft — ${budget.over} ft past a ${budget.total} ft budget.`
+            );
+          }
+        }
+        queueMicrotask(() => {
+          requestAnimationFrame(() => applySceneTriggers());
+        });
       },
 
       deletePC: (id) =>
@@ -773,7 +1120,9 @@ export const useRAM = create<RAMState>()(
           selectedPcId: get().selectedPcId === id ? null : get().selectedPcId,
           areaPresence: get().areaPresence.filter((entry) => entry.creatureId !== id),
           tokenFloaters: get().tokenFloaters.filter((entry) => entry.creatureId !== id),
+          tokenIntents: get().tokenIntents.filter((entry) => entry.creatureId !== id),
           creatureSheens: get().creatureSheens.filter((entry) => entry.creatureId !== id),
+          combat: get().combat ? removeFromOrder(get().combat!, id) : null,
         }),
 
       selectPC: (id) => set({ selectedPcId: id }),
@@ -801,6 +1150,12 @@ export const useRAM = create<RAMState>()(
           statuses: blueprint.statuses.map((status) => ({ ...status, id: uid() })),
           ruleChoices: Object.fromEntries(
             Object.entries(blueprint.ruleChoices ?? {}).map(([key, values]) => [key, [...values]])
+          ),
+          abilityImprovements: (blueprint.abilityImprovements ?? []).map(
+            (improvement) => ({
+              ...improvement,
+              increases: { ...improvement.increases },
+            })
           ),
           inventory: blueprint.inventory.map((item) => ({ ...item, id: uid() })),
           wallet: { ...blueprint.wallet },
@@ -846,6 +1201,28 @@ export const useRAM = create<RAMState>()(
         });
       },
 
+      setPCIntent: (intent) =>
+        set({
+          tokenIntents: [
+            ...get().tokenIntents,
+            {
+              ...intent,
+              id: uid(),
+              status: "pending",
+              createdAt: Date.now(),
+            },
+          ],
+        }),
+
+      clearPCIntent: (creatureId, intentId) =>
+        set({
+          tokenIntents: get().tokenIntents.filter(
+            (entry) =>
+              entry.creatureId !== creatureId ||
+              (intentId !== undefined && entry.id !== intentId)
+          ),
+        }),
+
       duplicateToken: (id) => {
         const source = get().tokens.find((token) => token.id === id);
         if (!source) return;
@@ -863,6 +1240,12 @@ export const useRAM = create<RAMState>()(
           ruleChoices: Object.fromEntries(
             Object.entries(source.ruleChoices ?? {}).map(([key, values]) => [key, [...values]])
           ),
+          abilityImprovements: (source.abilityImprovements ?? []).map(
+            (improvement) => ({
+              ...improvement,
+              increases: { ...improvement.increases },
+            })
+          ),
           inventory: source.inventory.map((item) => ({ ...item, id: uid() })),
           wallet: { ...source.wallet },
           statBlock: source.statBlock ? cloneStatBlock(source.statBlock) : null,
@@ -877,6 +1260,7 @@ export const useRAM = create<RAMState>()(
           areaPresence: get().areaPresence.filter((entry) => entry.creatureId !== id),
           tokenFloaters: get().tokenFloaters.filter((entry) => entry.creatureId !== id),
           creatureSheens: get().creatureSheens.filter((entry) => entry.creatureId !== id),
+          combat: get().combat ? removeFromOrder(get().combat!, id) : null,
         }),
 
       addTokenBlueprint: (blueprint) =>
@@ -1028,6 +1412,7 @@ export const useRAM = create<RAMState>()(
         const weatherChanged = nextWeather !== current.weather;
         const weatherMs = reducedMotion(current.uiSettings.motion) ? 80 : 1200;
         set({
+          tokenIntents: [],
           sceneTransition: {
             startedAt,
             durationMs,
@@ -1056,6 +1441,8 @@ export const useRAM = create<RAMState>()(
             : null,
           music: cloneEnvironmentTrack(environment.music),
           ambience: cloneEnvironmentTrack(environment.ambience),
+          battleMusic: cloneEnvironmentTrack(environment.battleMusic),
+          combat: null,
           tokens: environment.tokens.map(cloneMapToken),
           saveAreas: (environment.saveAreas ?? []).map(cloneSaveArea),
           areaPresence: [],
@@ -1099,6 +1486,7 @@ export const useRAM = create<RAMState>()(
                   background: get().background ? { ...get().background! } : null,
                   music: cloneEnvironmentTrack(get().music),
                   ambience: cloneEnvironmentTrack(get().ambience),
+                  battleMusic: cloneEnvironmentTrack(get().battleMusic),
                   tokens: get().tokens.map(cloneMapToken),
                   saveAreas: get().saveAreas.map(cloneSaveArea),
                 }
@@ -1167,6 +1555,12 @@ export const useRAM = create<RAMState>()(
 
       setAmbience: (ambience) =>
         set({ ambience: cloneEnvironmentTrack(ambience) }),
+
+      setBattleMusic: (battleMusic) =>
+        set({ battleMusic: cloneEnvironmentTrack(battleMusic) }),
+
+      setDefaultBattleMusic: (battleMusic) =>
+        set({ defaultBattleMusic: cloneEnvironmentTrack(battleMusic) }),
 
       addSaveArea: (cells) => {
         const origin = get().pcs[0];
@@ -1277,7 +1671,10 @@ export const useRAM = create<RAMState>()(
 
       addLog: (entry) =>
         set({
-          log: [...get().log, { ...entry, id: uid(), ts: Date.now() }],
+          log: boundedLog(
+            [...get().log, { ...entry, id: uid(), ts: Date.now() }],
+            get().uiSettings.maxConsoleEntries
+          ),
         }),
 
       clearLog: () =>
@@ -1299,15 +1696,172 @@ export const useRAM = create<RAMState>()(
       /** Forgets the digest but keeps the log, so the next pass rebuilds it. */
       clearMemory: () => set({ memory: { ...DEFAULT_SESSION_MEMORY, bullets: [] } }),
 
+      startCombat: (entries) => {
+        if (!entries.length) return;
+        const combatants = openingOrder(entries.map(createCombatant));
+        set({
+          combat: {
+            round: 1,
+            turnIndex: 0,
+            combatants,
+            startedAt: Date.now(),
+          },
+        });
+        const order = combatants
+          .map(
+            (entry, index) =>
+              `${index + 1}. ${combatantName(entry)} ${entry.initiative}`
+          )
+          .join(" · ");
+        logCombat(`Initiative — ${order}`);
+        announceTurn();
+      },
+
+      endCombat: () => {
+        const combat = get().combat;
+        if (!combat) return;
+        set({ combat: null });
+        logCombat(
+          `Combat ended after ${combat.round} ${combat.round === 1 ? "round" : "rounds"}.`
+        );
+      },
+
+      nextTurn: () => {
+        const combat = get().combat;
+        if (!combat) return;
+        const { combat: next } = advanceTurn(combat, 1, combatantIsDead);
+        set({ combat: next });
+        announceTurn();
+      },
+
+      prevTurn: () => {
+        const combat = get().combat;
+        if (!combat) return;
+        const { combat: next } = advanceTurn(combat, -1, combatantIsDead);
+        set({ combat: next });
+        announceTurn();
+      },
+
+      addCombatant: (id, isPC, d20, dexMod) => {
+        const combat = get().combat;
+        if (!combat) return;
+        const combatant = createCombatant({ id, isPC, d20, dexMod });
+        set({ combat: insertInOrder(combat, combatant) });
+        logCombat(
+          `${combatantName(combatant)} joins at initiative ${combatant.initiative}.`
+        );
+      },
+
+      removeCombatant: (id) => {
+        const combat = get().combat;
+        if (!combat) return;
+        const combatant = combat.combatants.find((entry) => entry.id === id);
+        const next = removeFromOrder(combat, id);
+        set({ combat: next });
+        if (combatant) logCombat(`${combatantName(combatant)} leaves the fight.`);
+        if (!next) logCombat("Combat ended — no combatants left.");
+      },
+
+      setInitiative: (id, initiative) => {
+        const combat = get().combat;
+        if (!combat) return;
+        const activeId = activeCombatant(combat)?.id;
+        const combatants = sortCombatants(
+          combat.combatants.map((entry) =>
+            entry.id === id
+              ? { ...entry, initiative: Math.round(initiative) }
+              : entry
+          )
+        );
+        set({
+          combat: {
+            ...combat,
+            combatants,
+            turnIndex: activeId
+              ? Math.max(
+                  0,
+                  combatants.findIndex((entry) => entry.id === activeId)
+                )
+              : combat.turnIndex,
+          },
+        });
+      },
+
+      spendActionSlot: (id, slot, spent) => {
+        const combat = get().combat;
+        if (!combat) return;
+        set({
+          combat: {
+            ...combat,
+            combatants: combat.combatants.map((entry) =>
+              entry.id === id ? { ...entry, [slot]: spent ?? !entry[slot] } : entry
+            ),
+          },
+        });
+      },
+
+      toggleDash: (id) => {
+        const combat = get().combat;
+        if (!combat) return;
+        set({
+          combat: {
+            ...combat,
+            combatants: combat.combatants.map((entry) =>
+              entry.id === id
+                ? { ...entry, dashes: entry.dashes > 0 ? 0 : 1 }
+                : entry
+            ),
+          },
+        });
+      },
+
+      rollDeathSave: (id, isPC, d20) => {
+        const creature = creatureById(id, isPC);
+        if (!creature) return;
+        const result = applyDeathSaveRoll(creature, d20);
+        const state = get();
+        set(
+          isPC
+            ? { pcs: state.pcs.map((pc) => (pc.id === id ? (result.creature as PC) : pc)) }
+            : {
+                tokens: state.tokens.map((token) =>
+                  token.id === id ? (result.creature as MapToken) : token
+                ),
+              }
+        );
+        get().addTokenFloater({
+          creatureId: id,
+          title: result.title,
+          detail: result.detail,
+          outcome: result.outcome,
+        });
+        get().addLog({
+          role: "system",
+          author: "Save",
+          text: `${creature.name} — ${result.log}`,
+        });
+      },
+
       setSettings: (patch) => {
         set({ settings: normalizeAISettings({ ...get().settings, ...patch }) });
         if (patch.perceptionRadius !== undefined) applySceneTriggers();
       },
 
-      setUISettings: (patch) => {
+      setGameplaySettings: (patch) =>
         set({
-          uiSettings: normalizeUISettings({ ...get().uiSettings, ...patch }),
+          gameplaySettings: normalizeGameplaySettings({
+            ...get().gameplaySettings,
+            ...patch,
+          }),
+        }),
+
+      setUISettings: (patch) => {
+        const next = normalizeUISettings({ ...get().uiSettings, ...patch });
+        set({
+          uiSettings: next,
+          log: boundedLog(get().log, next.maxConsoleEntries),
         });
+        setCampaignWriteDelay(next.autosaveEveryMs);
       },
 
       setSettingsOpen: (open) => set({ settingsOpen: open }),
@@ -1326,9 +1880,9 @@ export const useRAM = create<RAMState>()(
       };
     },
     {
-      name: "ram-campaign",
-      storage: createJSONStorage(() => campaignStateStorage),
-      version: 33,
+      name: campaignStorageKey(),
+      storage: createCampaignPersistStorage(),
+      version: 36,
       onRehydrateStorage: () => (state, error) => {
         markCampaignStorageReady();
         if (error || !state) return;
@@ -1368,8 +1922,26 @@ export const useRAM = create<RAMState>()(
           music: persisted.music !== undefined ? persisted.music : currentState.music,
           ambience:
             persisted.ambience !== undefined ? persisted.ambience : currentState.ambience,
+          battleMusic:
+            persisted.battleMusic !== undefined
+              ? persisted.battleMusic
+              : currentState.battleMusic,
+          defaultBattleMusic:
+            persisted.defaultBattleMusic !== undefined
+              ? persisted.defaultBattleMusic
+              : currentState.defaultBattleMusic,
+          combat: normalizeCombat(persisted.combat),
           saveAreas: persisted.saveAreas ?? currentState.saveAreas,
           areaPresence: persisted.areaPresence ?? currentState.areaPresence,
+          tokenIntents: (persisted.tokenIntents ?? currentState.tokenIntents).map(
+            normalizeTokenIntent
+          ),
+          gameplaySettings: normalizeGameplaySettings(
+            persisted.gameplaySettings ?? currentState.gameplaySettings
+          ),
+          uiSettings: normalizeUISettings(
+            omitLegacyDiceLook(persisted.uiSettings ?? currentState.uiSettings)
+          ),
           creatureSheens: [],
         };
       },
@@ -1436,6 +2008,17 @@ export const useRAM = create<RAMState>()(
               key,
               [...choices],
             ])
+          ),
+          abilityImprovements: (value.abilityImprovements ?? []).map(
+            (improvement) => ({
+              level: Math.max(1, Math.min(20, Math.round(improvement.level))),
+              increases: Object.fromEntries(
+                Object.entries(improvement.increases ?? {}).map(([key, increase]) => [
+                  key,
+                  Math.max(0, Math.min(2, Math.round(increase ?? 0))),
+                ])
+              ),
+            })
           ),
           creatureType: value.creatureType ?? "humanoid",
           size: value.size ?? "medium",
@@ -1549,6 +2132,35 @@ export const useRAM = create<RAMState>()(
         const normalizeRule = (value: RuleDefinition): RuleDefinition =>
           cloneRule({
             ...value,
+            minLevel: Math.max(1, Math.min(20, value.minLevel ?? 1)),
+            abilityScoreImprovementLevels: [
+              ...new Set(
+                (value.abilityScoreImprovementLevels ?? [])
+                  .map((level) => Math.round(level))
+                  .filter((level) => level >= 1 && level <= 20)
+              ),
+            ].sort((a, b) => a - b),
+            resourceTracks: (value.resourceTracks ?? []).map((track) => ({
+              ...track,
+              values: (track.values ?? []).map((entry) => ({ ...entry })),
+            })),
+            spellcasting: value.spellcasting
+              ? {
+                  ...value.spellcasting,
+                  slotsByLevel: (value.spellcasting.slotsByLevel ?? []).map(
+                    (row) => [...row]
+                  ),
+                  slotLevels: value.spellcasting.slotLevels
+                    ? [...value.spellcasting.slotLevels]
+                    : undefined,
+                  cantripsKnown: value.spellcasting.cantripsKnown
+                    ? [...value.spellcasting.cantripsKnown]
+                    : undefined,
+                  spellsKnown: value.spellcasting.spellsKnown
+                    ? [...value.spellcasting.spellsKnown]
+                    : undefined,
+                }
+              : null,
             abilityBonuses: { ...(value.abilityBonuses ?? {}) },
             saveBonuses: { ...(value.saveBonuses ?? {}) },
             saveProficiencies: [...(value.saveProficiencies ?? [])],
@@ -1561,13 +2173,30 @@ export const useRAM = create<RAMState>()(
             damageImmunities: [...(value.damageImmunities ?? [])],
             conditionImmunities: [...(value.conditionImmunities ?? [])],
             specialActions: [...(value.specialActions ?? [])],
-            features: (value.features ?? []).map((feature) => ({ ...feature })),
+            features: (value.features ?? []).map((feature) => ({
+              ...feature,
+              grants: feature.grants
+                ? {
+                    expertise: feature.grants.expertise
+                      ? [...feature.grants.expertise]
+                      : undefined,
+                    halfProficiencyAbilities: feature.grants.halfProficiencyAbilities
+                      ? [...feature.grants.halfProficiencyAbilities]
+                      : undefined,
+                  }
+                : undefined,
+            })),
             hitDie: value.hitDie ?? 0,
             sourcePage: value.sourcePage ?? 0,
             unarmoredAcAbilities: [...(value.unarmoredAcAbilities ?? [])],
             startingKit: (value.startingKit ?? []).map((entry) => ({ ...entry })),
             choices: (value.choices ?? []).map((choice) => ({
               ...choice,
+              level: Math.max(1, Math.min(20, choice.level ?? 1)),
+              levelCounts: (choice.levelCounts ?? []).map((entry) => ({
+                level: Math.max(1, Math.min(20, entry.level)),
+                count: Math.max(1, entry.count),
+              })),
               options: [...(choice.options ?? [])],
             })),
           });
@@ -1580,6 +2209,36 @@ export const useRAM = create<RAMState>()(
             const prior = priorRulesById.get(defaultRule.id);
             if (!prior) return cloneRule(defaultRule);
             if (version < 19) return cloneRule(defaultRule);
+            if (version < 35) {
+              const priorChoices = new Map(
+                (prior.choices ?? []).map((choice) => [choice.id, choice])
+              );
+              const mergedChoices = defaultRule.choices.map((defaultChoice) => ({
+                ...defaultChoice,
+                ...(priorChoices.get(defaultChoice.id) ?? {}),
+                level: defaultChoice.level,
+                levelCounts: defaultChoice.levelCounts,
+              }));
+              const defaultChoiceIds = new Set(
+                defaultRule.choices.map((choice) => choice.id)
+              );
+              return normalizeRule({
+                ...defaultRule,
+                ...prior,
+                minLevel: defaultRule.minLevel,
+                abilityScoreImprovementLevels:
+                  defaultRule.abilityScoreImprovementLevels,
+                resourceTracks: defaultRule.resourceTracks,
+                spellcasting: defaultRule.spellcasting,
+                features: defaultRule.features,
+                choices: [
+                  ...mergedChoices,
+                  ...(prior.choices ?? []).filter(
+                    (choice) => !defaultChoiceIds.has(choice.id)
+                  ),
+                ],
+              });
+            }
             return normalizeRule({ ...defaultRule, ...prior });
           }),
           ...priorRules
@@ -1603,6 +2262,7 @@ export const useRAM = create<RAMState>()(
                   customLibraryItems
                 ),
                 alignment: pc.alignment || "True Neutral",
+                goal: pc.goal ?? "",
                 knowledge: pc.knowledge ?? "",
                 width: pc.width ?? 1,
                 height: pc.height ?? 1,
@@ -1669,6 +2329,7 @@ export const useRAM = create<RAMState>()(
             background: environment.background ? { ...environment.background } : null,
             music: cloneEnvironmentTrack(environment.music),
             ambience: cloneEnvironmentTrack(environment.ambience),
+            battleMusic: cloneEnvironmentTrack(environment.battleMusic),
             tokens: (environment.tokens ?? []).map((token) =>
               withTokenLogistics(
                 withCalculatedStats(
@@ -1710,6 +2371,9 @@ export const useRAM = create<RAMState>()(
           weather: normalizeWeather(state.weather),
           music: cloneEnvironmentTrack(state.music),
           ambience: cloneEnvironmentTrack(state.ambience),
+          battleMusic: cloneEnvironmentTrack(state.battleMusic),
+          defaultBattleMusic: cloneEnvironmentTrack(state.defaultBattleMusic),
+          combat: normalizeCombat(state.combat),
           activeEnvironmentId: state.activeEnvironmentId ?? null,
           mapCamera: state.mapCamera ?? null,
           activeView: state.activeView === "world-map" ? "world-map" : "grid",
@@ -1721,6 +2385,10 @@ export const useRAM = create<RAMState>()(
             bullets: (state.memory?.bullets ?? []).filter(Boolean),
           },
           settings: normalizeAISettings(state.settings),
+          gameplaySettings: normalizeGameplaySettings(state.gameplaySettings),
+          tokenIntents: (state.tokenIntents ?? [])
+            .filter((intent) => intent.creatureId && intent.status === "pending")
+            .map(normalizeTokenIntent),
           uiSettings: normalizeUISettings(omitLegacyDiceLook(state.uiSettings)),
         };
       },
@@ -1734,6 +2402,7 @@ export const useRAM = create<RAMState>()(
         environments: s.environments,
         saveAreas: s.saveAreas,
         areaPresence: s.areaPresence,
+        tokenIntents: s.tokenIntents,
         deletedLibraryItemIds: s.deletedLibraryItemIds,
         deletedRuleDefinitionIds: s.deletedRuleDefinitionIds,
         background: s.background,
@@ -1741,11 +2410,15 @@ export const useRAM = create<RAMState>()(
         weather: s.weather,
         music: s.music,
         ambience: s.ambience,
+        battleMusic: s.battleMusic,
+        defaultBattleMusic: s.defaultBattleMusic,
+        combat: s.combat,
         activeEnvironmentId: s.activeEnvironmentId,
         activeView: s.activeView,
         log: s.log,
         memory: s.memory,
         settings: s.settings,
+        gameplaySettings: s.gameplaySettings,
         uiSettings: s.uiSettings,
       }),
     }

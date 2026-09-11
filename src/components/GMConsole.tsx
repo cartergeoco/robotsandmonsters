@@ -1,216 +1,162 @@
-import { Loader2, MessageCircle, Send, Trash2, X } from "lucide-react";
-import { useDiceRoll, type RollResult } from "react-ttrpg-dice";
-import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { generatePCResponse } from "../ai";
+import { Brain, Copy, Loader2, MessageCircle, Send, Trash2 } from "lucide-react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { generatePCResponse, pendingMemoryCount, summarizeSession } from "../ai";
+import { checkOptionsFor, findCheckOption } from "../checks";
+import { isActiveTurn } from "../combat";
+import { d20FromResult, requestD20Roll } from "../diceRolls";
 import { useRAM } from "../store";
-import { rollDie } from "../util";
-import type { DiceLook } from "../types";
+import { formatMod } from "../types";
+import { FOCUS_CONSOLE_EVENT } from "./QoLHost";
 import {
+  RamButton,
   RamConfirmDialog,
+  RamDialog,
   RamIconButton,
   RamInput,
   RamPanel,
   RamPanelHeader,
+  RamSelect,
+  RamTextarea,
 } from "./ui/RamPrimitives";
 
-const DICE = [4, 6, 8, 10, 12, 20, 100] as const;
-type DieSides = (typeof DICE)[number];
+const DiceTray = lazy(() =>
+  import("./DiceTray").then((module) => ({ default: module.DiceTray }))
+);
 
-const emptyDiceSelection = () =>
-  Object.fromEntries(DICE.map((sides) => [sides, 0])) as Record<DieSides, number>;
+/** Aged-out console entries required before the digest is regenerated. */
+const MEMORY_BATCH = 4;
 
-const DICE_LOOK_CONFIG: Record<
-  DiceLook,
-  {
-    theme: "obsidian" | "ivory" | "crimson" | "glass" | "metal";
-    dieColor: string;
-    numberColor: string;
-    accentColor: string;
-    roughness: number;
-    metalness: number;
-  }
-> = {
-  default: {
-    theme: "ivory",
-    dieColor: "#f4efe6",
-    numberColor: "#2a2a2a",
-    accentColor: "#c4b8a0",
-    roughness: 0.42,
-    metalness: 0.08,
-  },
-  monotone: {
-    theme: "obsidian",
-    dieColor: "#d8d8d8",
-    numberColor: "#1a1a1a",
-    accentColor: "#9a9a9a",
-    roughness: 0.85,
-    metalness: 0.05,
-  },
-  glossy: {
-    theme: "metal",
-    dieColor: "#f7f4ee",
-    numberColor: "#2a2a2a",
-    accentColor: "#c8b89a",
-    roughness: 0.12,
-    metalness: 0.72,
-  },
-  glass: {
-    theme: "glass",
-    dieColor: "#e8f0f8",
-    numberColor: "#1a1a1a",
-    accentColor: "#a8c4d8",
-    roughness: 0.08,
-    metalness: 0.2,
-  },
-};
-
-function naturalOutcomes(result: RollResult) {
-  const d20s = result.rolls.filter((die) => die.type === "d20");
-  return {
-    crits: d20s.filter((die) => die.value === 20).length,
-    fumbles: d20s.filter((die) => die.value === 1).length,
-  };
-}
-
-function logDiceResult(result: RollResult) {
+/**
+ * Folds console history that left the verbatim window into the session digest.
+ * Runs in the background and never blocks or interrupts a turn.
+ */
+async function refreshSessionMemory(force = false) {
   const state = useRAM.getState();
-  const details = result.rolls.map((die) => die.value).join(", ");
-  const { crits, fumbles } = naturalOutcomes(result);
-  const extras = [
-    crits > 0 ? `${crits === 1 ? "Natural 20" : `${crits} natural 20s`}` : "",
-    fumbles > 0 ? `${fumbles === 1 ? "Natural 1" : `${fumbles} natural 1s`}` : "",
-  ].filter(Boolean);
-  const outcome = extras.length ? ` — ${extras.join(", ")}` : "";
-  state.addLog({
-    role: "system",
-    author: "Dice",
-    text: state.uiSettings.showDiceDetails
-      ? `${result.notation} → ${result.rolls.length > 1 ? `[${details}] = ` : ""}${result.total}${outcome}`
-      : `${result.notation} → ${result.total} total${outcome}`,
+  const { settings, log, memory, campaignName } = state;
+  if (!settings.memoryEnabled || state.memoryBusy) return;
+  const pending = pendingMemoryCount(log, memory, settings.contextWindow);
+  if (pending < (force ? 1 : MEMORY_BATCH)) return;
+  state.setMemoryBusy(true);
+  try {
+    const next = await summarizeSession(log, memory, settings, campaignName);
+    if (!next) return;
+    // The log only grows, but a clear could have landed mid-request.
+    const current = useRAM.getState().log;
+    if (current[next.coveredCount - 1]?.id !== next.throughLogId) return;
+    useRAM.getState().setMemory(next);
+  } catch {
+    // A failed digest must not disturb play; the next pass tries again.
+  } finally {
+    useRAM.getState().setMemoryBusy(false);
+  }
+}
+
+function rollForPC(pcId: string, checkId: string, reason: string): Promise<string> {
+  return new Promise((resolve) => {
+    const state = useRAM.getState();
+    const pc = state.pcs.find((entry) => entry.id === pcId);
+    if (!pc) {
+      resolve("ERROR|character no longer exists");
+      return;
+    }
+    const option = findCheckOption(
+      checkOptionsFor(pc, state.ruleDefinitions, state.customLibraryItems),
+      checkId
+    );
+    if (!option) {
+      resolve(`ERROR|unknown check ${checkId}`);
+      return;
+    }
+    requestD20Roll((result) => {
+      const d20 = d20FromResult(result);
+      const total = d20 + option.modifier;
+      const natural = d20 === 20 ? " (natural 20)" : d20 === 1 ? " (natural 1)" : "";
+      const live = useRAM.getState();
+      live.addLog({
+        role: "system",
+        author: "Check",
+        authorId: pc.id,
+        color: pc.color,
+        text: `${pc.name} — ${option.shortLabel} ${d20} ${formatMod(option.modifier)} = ${total}${natural}${reason ? ` — ${reason}` : ""}.`,
+      });
+      live.addTokenFloater({
+        creatureId: pc.id,
+        title: option.shortLabel.toUpperCase(),
+        detail: String(total),
+        outcome: d20 === 1 ? "fail" : d20 === 20 ? "success" : "info",
+        color: pc.color,
+      });
+      resolve(
+        `ROLL|${option.id}|d20=${d20}|modifier=${formatMod(option.modifier)}|total=${total}${natural}`
+      );
+    });
   });
 }
 
-function DiceTray({
-  look,
-  motion,
-}: {
-  look: DiceLook;
-  motion: "system" | "reduced";
-}) {
-  const [dice, setDice] = useState<Record<DieSides, number>>(emptyDiceSelection);
-  const [fx, setFx] = useState<"crit" | "fumble" | null>(null);
-  const [dissolving, setDissolving] = useState(false);
-  const lookConfig = DICE_LOOK_CONFIG[look];
-  const { roll, isRolling, result, DiceOverlayPortal } = useDiceRoll({
-    config: lookConfig,
-    cameraAngle: { x: 1.2, z: 2.4 },
-    sound: { volume: 0.28 },
-    zIndex: 80,
-    onRollComplete: (value) => {
-      const { crits, fumbles } = naturalOutcomes(value);
-      setFx(crits > 0 ? "crit" : fumbles > 0 ? "fumble" : null);
-      logDiceResult(value);
-    },
-  });
+function MemoryDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const memory = useRAM((s) => s.memory);
+  const memoryBusy = useRAM((s) => s.memoryBusy);
+  const memoryEnabled = useRAM((s) => s.settings.memoryEnabled);
+  const setMemoryBullets = useRAM((s) => s.setMemoryBullets);
+  const clearMemory = useRAM((s) => s.clearMemory);
+  const [draft, setDraft] = useState("");
 
   useEffect(() => {
-    if (isRolling) {
-      setDissolving(false);
-      setFx(null);
-      return;
-    }
-    if (!result) return;
-    const dissolveAt = window.setTimeout(() => setDissolving(true), 1500);
-    const clearFx = window.setTimeout(() => setFx(null), 2400);
-    return () => {
-      window.clearTimeout(dissolveAt);
-      window.clearTimeout(clearFx);
-    };
-  }, [isRolling, result]);
+    if (open) setDraft(useRAM.getState().memory.bullets.join("\n"));
+  }, [open]);
 
-  const diceNotation = DICE.filter((sides) => dice[sides] > 0)
-    .map((sides) => `${dice[sides]}d${sides}`)
-    .join(" + ");
-
-  function addDie(sides: DieSides) {
-    setDice((current) => ({
-      ...current,
-      [sides]: Math.min(20, current[sides] + 1),
-    }));
-  }
-
-  function rollSelected() {
-    if (!diceNotation || isRolling) return;
-    if (motion === "reduced") {
-      const rolls = DICE.flatMap((sides) =>
-        Array.from({ length: dice[sides] }, () => {
-          const value = rollDie(sides);
-          return {
-            type: `d${sides}` as RollResult["rolls"][number]["type"],
-            value,
-            isMax: value === sides,
-            isMin: value === 1,
-          };
-        })
-      );
-      const next: RollResult = {
-        notation: diceNotation,
-        total: rolls.reduce((sum, die) => sum + die.value, 0),
-        rolls,
-      };
-      const { crits, fumbles } = naturalOutcomes(next);
-      setFx(crits > 0 ? "crit" : fumbles > 0 ? "fumble" : null);
-      logDiceResult(next);
-      setDice(emptyDiceSelection());
-      return;
-    }
-    roll(diceNotation);
-    setDice(emptyDiceSelection());
-  }
+  const commit = () => {
+    const stored = useRAM.getState().memory.bullets.join("\n");
+    if (draft.trim() === stored.trim()) return;
+    setMemoryBullets(draft.split("\n"));
+  };
 
   return (
-    <>
-      <div className="dice-cluster" data-dice-look={look}>
-        <div className="dice-row">
-          {DICE.map((d) => (
-            <button
-              className={`dice-button dice-button--${d}${dice[d] > 0 ? " is-selected" : ""}`}
-              key={d}
-              disabled={isRolling}
-              onClick={() => addDie(d)}
-              aria-label={`Add d${d}${dice[d] ? `, ${dice[d]} selected` : ""}`}
-            >
-              <span>d{d}</span>
-              {dice[d] > 0 && <strong>{dice[d]}</strong>}
-            </button>
-          ))}
-        </div>
-        {diceNotation && (
-          <RamIconButton label="Clear selected dice" onClick={() => setDice(emptyDiceSelection())}>
-            <X size={14} strokeWidth={1.5} />
-          </RamIconButton>
-        )}
-        <button className="roll-button" disabled={!diceNotation || isRolling} onClick={rollSelected}>
-          {isRolling ? "Rolling" : "Roll"}
-        </button>
-      </div>
-      {(DiceOverlayPortal || fx) &&
-        createPortal(
-        <div
-          className={`dice-stage${dissolving ? " is-dissolving" : ""}${fx ? ` dice-stage--${fx}` : ""}`}
-          aria-hidden="true"
+    <RamDialog
+      open={open}
+      title="Session memory"
+      onClose={() => {
+        commit();
+        onClose();
+      }}
+    >
+      <p className="settings-note">
+        {memoryEnabled
+          ? "Older console history is condensed into these notes and sent to every character. Correct anything the summary got wrong."
+          : "Session memory is switched off in Settings. These notes are kept but not sent."}
+      </p>
+      <RamTextarea
+        aria-label="Session memory notes"
+        rows={10}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        placeholder="One remembered fact per line…"
+      />
+      <div className="settings-ai-actions">
+        <RamButton
+          size="sm"
+          disabled={memoryBusy}
+          onClick={() => {
+            commit();
+            void refreshSessionMemory(true);
+          }}
         >
-          {DiceOverlayPortal}
-          {fx && (
-            <div className={`dice-fx dice-fx--${fx}`}>
-              <span>{fx === "crit" ? "Natural 20" : "Natural 1"}</span>
-            </div>
-          )}
-        </div>,
-        document.body
-      )}
-    </>
+          {memoryBusy ? "Summarizing" : "Summarize now"}
+        </RamButton>
+        <RamButton
+          size="sm"
+          variant="danger"
+          disabled={memory.bullets.length === 0}
+          onClick={() => {
+            clearMemory();
+            setDraft("");
+          }}
+        >
+          Forget
+        </RamButton>
+      </div>
+    </RamDialog>
   );
 }
 
@@ -218,12 +164,39 @@ export function GMConsole() {
   const log = useRAM((s) => s.log);
   const pcs = useRAM((s) => s.pcs);
   const thinking = useRAM((s) => s.thinking);
+  const memoryBusy = useRAM((s) => s.memoryBusy);
+  const memoryCount = useRAM((s) => s.memory.bullets.length);
   const addLog = useRAM((s) => s.addLog);
   const clearLog = useRAM((s) => s.clearLog);
   const ui = useRAM((s) => s.uiSettings);
   const [draft, setDraft] = useState("");
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [roleFilter, setRoleFilter] = useState<"all" | "gm" | "pc" | "system">("all");
+  const [authorFilter, setAuthorFilter] = useState("all");
+  const [logQuery, setLogQuery] = useState("");
+  const [turnUsage, setTurnUsage] = useState<
+    Record<string, { inputTokens: number; loreEntries: number }>
+  >({});
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const visibleLog = useMemo(() => {
+    const query = logQuery.trim().toLocaleLowerCase();
+    return log.filter(
+      (entry) =>
+        (roleFilter === "all" || entry.role === roleFilter) &&
+        (authorFilter === "all" || entry.authorId === authorFilter) &&
+        (!query ||
+          entry.author.toLocaleLowerCase().includes(query) ||
+          entry.text.toLocaleLowerCase().includes(query))
+    );
+  }, [authorFilter, log, logQuery, roleFilter]);
+
+  useEffect(() => {
+    const focus = () => inputRef.current?.focus();
+    window.addEventListener(FOCUS_CONSOLE_EVENT, focus);
+    return () => window.removeEventListener(FOCUS_CONSOLE_EVENT, focus);
+  }, []);
 
   useEffect(() => {
     if (!ui.autoScrollConsole) return;
@@ -236,29 +209,95 @@ export function GMConsole() {
     if (!text) return;
     addLog({ role: "gm", author: "GM", text });
     setDraft("");
+    void refreshSessionMemory();
   }
 
   async function askPC(pcId: string) {
     const s = useRAM.getState();
     const pc = s.pcs.find((p) => p.id === pcId);
     if (!pc || s.thinking.includes(pcId)) return;
+    s.clearPCIntent(pcId);
     s.setThinking(pcId, true);
     try {
-      const text = await generatePCResponse(
+      const text = await generatePCResponse({
         pc,
-        s.pcs,
-        s.log,
-        s.settings,
-        s.ruleDefinitions,
-        s.customLibraryItems
-      );
-      useRAM.getState().addLog({
-        role: "pc",
-        author: pc.name,
-        authorId: pc.id,
-        color: pc.color,
-        text,
+        party: s.pcs,
+        log: s.log,
+        settings: s.settings,
+        rules: s.ruleDefinitions,
+        libraryItems: s.customLibraryItems,
+        tokens: s.tokens,
+        lighting: s.lighting,
+        weather: s.weather,
+        environments: s.environments,
+        activeEnvironmentId: s.activeEnvironmentId,
+        memory: s.memory,
+        combat: s.combat,
+        gameplay: s.gameplaySettings,
+        emitIntent: (intent) => {
+          const live = useRAM.getState();
+          if (live.gameplaySettings.intentBubbles) {
+            live.setPCIntent(intent);
+          }
+          if (!live.gameplaySettings.intentBubbles || intent.autonomy === "announce") {
+            live.addLog({
+              role: "pc",
+              author: pc.name,
+              authorId: pc.id,
+              color: pc.color,
+              text: `*${intent.title}: ${intent.detail}*`,
+            });
+          }
+        },
+        say: (message) =>
+          useRAM.getState().addLog({
+            role: "pc",
+            author: pc.name,
+            authorId: pc.id,
+            color: pc.color,
+            text: message,
+          }),
+        emote: (message) =>
+          useRAM.getState().addLog({
+            role: "pc",
+            author: pc.name,
+            authorId: pc.id,
+            color: pc.color,
+            text: `*${message}*`,
+          }),
+        updatePC: (patch) => useRAM.getState().updatePC(pc.id, patch),
+        getLiveState: () => {
+          const live = useRAM.getState();
+          return {
+            pc: live.pcs.find((entry) => entry.id === pc.id) ?? pc,
+            party: live.pcs,
+            tokens: live.tokens,
+          };
+        },
+        movePC: (cell) => useRAM.getState().moveCreature(pc.id, true, cell.x, cell.y),
+        rollCheck: (checkId, reason) => rollForPC(pc.id, checkId, reason),
+        endTurn: () => {
+          const live = useRAM.getState();
+          if (!isActiveTurn(live.combat, pc.id)) return false;
+          live.nextTurn();
+          return true;
+        },
+        onUsageEstimate: (inputTokens, loreEntries) =>
+          setTurnUsage((current) => ({
+            ...current,
+            [pc.id]: { inputTokens, loreEntries },
+          })),
       });
+      if (text) {
+        useRAM.getState().addLog({
+          role: "pc",
+          author: pc.name,
+          authorId: pc.id,
+          color: pc.color,
+          text,
+        });
+      }
+      void refreshSessionMemory();
     } catch (err) {
       useRAM.getState().addLog({
         role: "system",
@@ -284,19 +323,66 @@ export function GMConsole() {
       <RamPanelHeader
         title="Console"
         actions={
-          <RamIconButton
-            label="Clear console"
-            variant="danger"
-            disabled={log.length === 0}
-            onClick={clearConsole}
-          >
-            <Trash2 size={16} strokeWidth={1.5} />
-          </RamIconButton>
+          <>
+            <RamIconButton
+              label={
+                memoryBusy
+                  ? "Summarizing session memory"
+                  : `Session memory (${memoryCount} note${memoryCount === 1 ? "" : "s"})`
+              }
+              onClick={() => setMemoryOpen(true)}
+            >
+              {memoryBusy ? (
+                <Loader2 size={16} className="spin" />
+              ) : (
+                <Brain size={16} strokeWidth={1.5} />
+              )}
+            </RamIconButton>
+            <RamIconButton
+              label="Clear console"
+              variant="danger"
+              disabled={log.length === 0}
+              onClick={clearConsole}
+            >
+              <Trash2 size={16} strokeWidth={1.5} />
+            </RamIconButton>
+          </>
         }
       />
       <div className="gm-body">
-        <div className="log-scroll" ref={scrollRef}>
-          {log.map((e) => (
+        <div className="console-log-column">
+          <div className="console-filters">
+            <RamInput
+              aria-label="Search console"
+              placeholder="Filter messages…"
+              value={logQuery}
+              onChange={(event) => setLogQuery(event.target.value)}
+            />
+            <RamSelect
+              aria-label="Filter console by type"
+              value={roleFilter}
+              onChange={(event) =>
+                setRoleFilter(event.target.value as typeof roleFilter)
+              }
+            >
+              <option value="all">All types</option>
+              <option value="gm">GM</option>
+              <option value="pc">Characters</option>
+              <option value="system">System & dice</option>
+            </RamSelect>
+            <RamSelect
+              aria-label="Filter console by character"
+              value={authorFilter}
+              onChange={(event) => setAuthorFilter(event.target.value)}
+            >
+              <option value="all">All characters</option>
+              {pcs.map((pc) => (
+                <option value={pc.id} key={pc.id}>{pc.name}</option>
+              ))}
+            </RamSelect>
+          </div>
+          <div className="log-scroll" ref={scrollRef}>
+          {visibleLog.map((e) => (
             <div className={`log-entry ${e.role}`} key={e.id}>
               <span className="log-copy">
                 <span
@@ -319,8 +405,19 @@ export function GMConsole() {
                 </span>
                 <span className="log-text">{e.text}</span>
               </span>
+              <RamIconButton
+                className="log-copy-button"
+                label={`Copy message from ${e.author}`}
+                onClick={() => void navigator.clipboard.writeText(e.text)}
+              >
+                <Copy size={13} strokeWidth={1.5} />
+              </RamIconButton>
             </div>
           ))}
+          {visibleLog.length === 0 && (
+            <span className="token-catalog-empty">No console messages match.</span>
+          )}
+          </div>
         </div>
         <div className="gm-side">
           <span className="gm-side__label">Ask a character</span>
@@ -350,6 +447,14 @@ export function GMConsole() {
                   </span>
                 )}
                 <span className="player-action__name">{pc.name}</span>
+                {turnUsage[pc.id] && (
+                  <small
+                    className="player-action__usage"
+                    title={`${turnUsage[pc.id].loreEntries} context lookups`}
+                  >
+                    ~{turnUsage[pc.id].inputTokens.toLocaleString()} in
+                  </small>
+                )}
                 <MessageCircle
                   className="player-action__indicator"
                   size={14}
@@ -362,13 +467,12 @@ export function GMConsole() {
         </div>
       </div>
       <div className="gm-input-row">
-        <DiceTray
-          key={ui.diceLook}
-          look={ui.diceLook}
-          motion={ui.motion}
-        />
+        <Suspense fallback={null}>
+          <DiceTray motion={ui.motion} />
+        </Suspense>
         <div className="command-field">
           <RamInput
+            ref={inputRef}
             placeholder="Describe what happens…"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -382,10 +486,11 @@ export function GMConsole() {
         </div>
       </div>
       </RamPanel>
+      <MemoryDialog open={memoryOpen} onClose={() => setMemoryOpen(false)} />
       <RamConfirmDialog
         open={confirmClearOpen}
         title="Clear console?"
-        description="Every console message will be removed. This cannot be undone."
+        description="Every console message and the session memory will be removed. This cannot be undone."
         confirmLabel="Clear"
         onConfirm={clearLog}
         onClose={() => setConfirmClearOpen(false)}

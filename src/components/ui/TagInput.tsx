@@ -68,34 +68,38 @@ export function TagInput({
             </button>
           </span>
         ))}
-        <input
-          value={draft}
-          list={listId}
-          disabled={atLimit}
-          placeholder={atLimit ? `${max} selected` : placeholder}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={onKeyDown}
-        />
-        <datalist id={listId}>
-          {available.map((suggestion) => (
-            <option value={suggestion} key={suggestion} />
-          ))}
-        </datalist>
+        {!atLimit && allowCustom && (
+          <input
+            value={draft}
+            list={listId}
+            placeholder={values.length ? "Add…" : placeholder}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={onKeyDown}
+          />
+        )}
+        {allowCustom && (
+          <datalist id={listId}>
+            {available.map((suggestion) => (
+              <option value={suggestion} key={suggestion} />
+            ))}
+          </datalist>
+        )}
       </div>
-      <select
-        className="tag-input__browse"
-        value=""
-        disabled={atLimit || available.length === 0}
-        aria-label={`Browse all ${ariaLabel.toLowerCase()}`}
-        onChange={(event) => add(event.target.value)}
-      >
-        <option value="">All tags…</option>
-        {available.map((suggestion) => (
-          <option value={suggestion} key={suggestion}>
-            {suggestion}
-          </option>
-        ))}
-      </select>
+      {!atLimit && available.length > 0 && (
+        <select
+          className="tag-input__browse"
+          value=""
+          aria-label={`Add ${ariaLabel.toLowerCase()} from list`}
+          onChange={(event) => add(event.target.value)}
+        >
+          <option value="">Add from list…</option>
+          {available.map((suggestion) => (
+            <option value={suggestion} key={suggestion}>
+              {suggestion}
+            </option>
+          ))}
+        </select>
+      )}
     </div>
   );
 }

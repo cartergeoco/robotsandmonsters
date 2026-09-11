@@ -1,5 +1,12 @@
 import type { CSSProperties } from "react";
-import { tokenBoundsSize, type TokenCell } from "../types";
+import {
+  DEFAULT_VISUAL_SCALE,
+  VISUAL_SCALE_MAX,
+  VISUAL_SCALE_MIN,
+  normalizeVisualScale,
+  tokenBoundsSize,
+  type TokenCell,
+} from "../types";
 
 const GRID_SIZE = 9;
 const GRID_RADIUS = Math.floor(GRID_SIZE / 2);
@@ -12,20 +19,26 @@ export function TokenBoundsEditor({
   bounds,
   image,
   color,
+  visualScale = DEFAULT_VISUAL_SCALE,
   disabled,
   onChange,
+  onScaleChange,
 }: {
   bounds: TokenCell[];
   image?: string;
   color: string;
+  visualScale?: number;
   disabled?: boolean;
   onChange: (bounds: TokenCell[]) => void;
+  onScaleChange?: (visualScale: number) => void;
 }) {
   const occupied = new Set(bounds.map(cellKey));
   const size = tokenBoundsSize(bounds);
+  const scale = normalizeVisualScale(visualScale);
   const artStyle: CSSProperties = {
     backgroundImage: image ? `url("${image}")` : undefined,
     backgroundColor: image ? undefined : `color-mix(in srgb, ${color} 22%, transparent)`,
+    transform: `scale(${scale})`,
   };
 
   function toggle(cell: TokenCell) {
@@ -42,7 +55,10 @@ export function TokenBoundsEditor({
     <div className="token-bounds-editor">
       <div className="token-bounds-editor__copy">
         <span className="ram-field__label">Token Visual & Bounds</span>
-        <small>Click cells to change occupied space. The centered visual stays one cell.</small>
+        <small>
+          Click cells to change occupied space. Scale only changes the picture, not the
+          footprint.
+        </small>
       </div>
       <div
         className="token-bounds-grid"
@@ -76,6 +92,24 @@ export function TokenBoundsEditor({
       <span className="token-bounds-size">
         {bounds.length} {bounds.length === 1 ? "cell" : "cells"} · {size.width}×{size.height}
       </span>
+      {onScaleChange && (
+        <label className="token-visual-scale">
+          <span className="ram-eyebrow">Visual scale</span>
+          <input
+            type="range"
+            min={VISUAL_SCALE_MIN}
+            max={VISUAL_SCALE_MAX}
+            step={0.05}
+            disabled={disabled}
+            value={scale}
+            aria-label="Token visual scale"
+            onChange={(event) =>
+              onScaleChange(normalizeVisualScale(Number(event.target.value)))
+            }
+          />
+          <span>{scale.toFixed(2)}×</span>
+        </label>
+      )}
     </div>
   );
 }

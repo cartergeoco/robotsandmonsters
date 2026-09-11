@@ -5,6 +5,7 @@ import {
   weatherHasWind,
   type EnvironmentWeather,
 } from "./types";
+import { emitThunderCue } from "./weatherEvents";
 
 interface Drop {
   x: number;
@@ -18,7 +19,8 @@ interface FogWisp {
   x: number;
   y: number;
   vx: number;
-  radius: number;
+  width: number;
+  height: number;
   opacity: number;
 }
 
@@ -55,25 +57,53 @@ const state: WeatherState = {
 
 const fogSprite = typeof document !== "undefined" ? document.createElement("canvas") : null;
 const fogSpriteCtx = fogSprite?.getContext("2d", { alpha: true }) ?? null;
+const dustFogSprite =
+  typeof document !== "undefined" ? document.createElement("canvas") : null;
+const dustFogSpriteCtx = dustFogSprite?.getContext("2d", { alpha: true }) ?? null;
 let fogSpriteReady = false;
 
-function ensureFogSprite() {
-  if (!fogSprite || !fogSpriteCtx || fogSpriteReady) return;
-  const size = 256;
-  fogSprite.width = size;
-  fogSprite.height = size;
-  const gradient = fogSpriteCtx.createRadialGradient(
-    size * 0.5,
-    size * 0.5,
-    size * 0.12,
-    size * 0.5,
-    size * 0.5,
-    size * 0.5
-  );
-  gradient.addColorStop(0, "rgba(210, 218, 226, 1)");
-  gradient.addColorStop(1, "rgba(210, 218, 226, 0)");
-  fogSpriteCtx.fillStyle = gradient;
-  fogSpriteCtx.fillRect(0, 0, size, size);
+function paintFogSprite(
+  canvas: HTMLCanvasElement,
+  context: CanvasRenderingContext2D,
+  color: [number, number, number]
+) {
+  const width = 512;
+  const height = 96;
+  canvas.width = width;
+  canvas.height = height;
+  const pixels = context.createImageData(width, height);
+  for (let y = 0; y < height; y++) {
+    const verticalFade = Math.sin((y / (height - 1)) * Math.PI) ** 1.8;
+    for (let x = 0; x < width; x++) {
+      const edgeFade = Math.sin((x / (width - 1)) * Math.PI) ** 0.7;
+      const broad =
+        0.62 +
+        Math.sin(x * 0.021 + y * 0.045) * 0.16 +
+        Math.sin(x * 0.008 - y * 0.071) * 0.12;
+      const fine = Math.sin(x * 0.083 + y * 0.12) * 0.05;
+      const alpha = Math.max(0, Math.min(1, (broad + fine) * verticalFade * edgeFade));
+      const index = (y * width + x) * 4;
+      pixels.data[index] = color[0];
+      pixels.data[index + 1] = color[1];
+      pixels.data[index + 2] = color[2];
+      pixels.data[index + 3] = Math.round(alpha * 255);
+    }
+  }
+  context.putImageData(pixels, 0, 0);
+}
+
+function ensureFogSprites() {
+  if (
+    !fogSprite ||
+    !fogSpriteCtx ||
+    !dustFogSprite ||
+    !dustFogSpriteCtx ||
+    fogSpriteReady
+  ) {
+    return;
+  }
+  paintFogSprite(fogSprite, fogSpriteCtx, [205, 214, 222]);
+  paintFogSprite(dustFogSprite, dustFogSpriteCtx, [166, 124, 75]);
   fogSpriteReady = true;
 }
 
@@ -114,14 +144,30 @@ function fillMotes(list: Mote[], count: number, speed: number) {
   if (list.length > count) list.length = count;
 }
 
+function fillDust(count: number, speed: number) {
+  while (state.dust.length < count) {
+    const depth = rand(0.25, 1);
+    state.dust.push({
+      x: rand(0, state.width || 1),
+      y: rand(0, state.height || 1),
+      vx: rand(speed * 0.65, speed * 1.2) * depth,
+      vy: rand(-speed * 0.08, speed * 0.08),
+      size: rand(0.65, 1.73) * (0.75 + depth * 0.5),
+      life: rand(0.2, 0.75),
+    });
+  }
+  if (state.dust.length > count) state.dust.length = count;
+}
+
 function fillFog(count: number) {
   while (state.fog.length < count) {
     state.fog.push({
-      x: rand(0, state.width || 1),
-      y: rand(0, state.height || 1),
-      vx: rand(0.12, 0.32),
-      radius: rand(90, 220),
-      opacity: rand(0.35, 1),
+      x: rand(-200, state.width || 1),
+      y: rand((state.height || 1) * 0.46, (state.height || 1) * 0.96),
+      vx: rand(0.05, 0.16),
+      width: rand(360, 820),
+      height: rand(38, 105),
+      opacity: rand(0.22, 0.68),
     });
   }
   if (state.fog.length > count) state.fog.length = count;
@@ -151,11 +197,11 @@ function profile(weather: EnvironmentWeather) {
     fog,
     haze:
       weather === "dust-storm"
-        ? { color: "168, 118, 62", alpha: 0.12 }
+        ? { color: "151, 105, 58", alpha: 0.34 }
         : rain === "heavy"
-          ? { color: "28, 42, 62", alpha: 0.05 }
+          ? { color: "28, 42, 62", alpha: 0.12 }
           : rain === "rain"
-            ? { color: "36, 52, 72", alpha: 0.03 }
+            ? { color: "36, 52, 72", alpha: 0.05 }
             : wind === "heavy"
               ? { color: "90, 104, 118", alpha: 0.04 }
               : null,
@@ -187,6 +233,8 @@ export function drawWeather(
   const wind = mix(from.wind, to.wind, t);
   const dust = mix(from.dust, to.dust, t);
   const fog = mix(from.fog, to.fog, t);
+  const dustFog = dust * 0.72;
+  const mist = Math.max(fog, dustFog);
   const thunder = t > 0.45 ? to.thunder : from.thunder;
   const hazeAlpha = mix(from.haze?.alpha ?? 0, to.haze?.alpha ?? 0, t);
   const hazeColor = t > 0.5 ? to.haze?.color : from.haze?.color;
@@ -196,22 +244,37 @@ export function drawWeather(
     ctx.fillRect(0, 0, width, height);
   }
 
-  if (fog > 0.01) {
+  if (mist > 0.01) {
     ctx.save();
-    ctx.fillStyle = `rgba(186, 198, 210, ${0.02 + fog * 0.025})`;
+    ctx.fillStyle =
+      dustFog > fog
+        ? `rgba(142, 98, 54, ${0.022 + dustFog * 0.04})`
+        : `rgba(186, 198, 210, ${0.012 + fog * 0.024})`;
     ctx.fillRect(0, 0, width, height);
     ctx.restore();
   }
 
+  if (thunder && now >= state.nextFlash) {
+    state.flash = 0.55 + Math.random() * 0.4;
+    const distanceDelay = 180 + Math.pow(Math.random(), 0.72) * 2400;
+    emitThunderCue({
+      delayMs: distanceDelay,
+      intensity: state.flash,
+      sample: 1 + Math.floor(Math.random() * 8),
+    });
+    state.nextFlash = now + 6500 + Math.random() * 12_000;
+  }
+
   if (reduced) {
+    state.flash *= 0.7;
     return thunder || rain > 0.02 || wind > 0.02 || dust > 0.02 || fog > 0.02 || t < 1;
   }
 
   const dropCount = Math.round(rain * (to.rainHeavy || from.rainHeavy ? 280 : 140));
   fillDrops(dropCount);
   fillMotes(state.motes, Math.round(wind * 70), 4 + wind * 8);
-  fillMotes(state.dust, Math.round(dust * 140), 3 + dust * 7);
-  fillFog(fog > 0.01 ? Math.round(5 + fog * 5) : 0);
+  fillDust(Math.round(dust * 1400), 5 + dust * 5.6);
+  fillFog(mist > 0.01 ? Math.round(10 + mist * 8) : 0);
 
   if (dropCount) {
     ctx.save();
@@ -247,37 +310,38 @@ export function drawWeather(
 
   if (state.dust.length) {
     ctx.save();
-    ctx.fillStyle = `rgba(186, 136, 72, ${0.14 + dust * 0.2})`;
+    ctx.fillStyle = `rgba(181, 131, 64, ${0.22 + dust * 1})`;
     for (const mote of state.dust) {
       mote.x += mote.vx;
-      mote.y += mote.vy + Math.sin(now * 0.001 + mote.y * 0.02) * 0.6;
+      mote.y += mote.vy + Math.sin(now * 0.0007 + mote.y * 0.018) * 0.18;
       wrapMote(mote, width, height);
-      const size = mote.size * 2.4;
-      ctx.fillRect(mote.x, mote.y, size, size);
+      ctx.fillRect(mote.x, mote.y, mote.size, mote.size);
     }
     ctx.restore();
   }
 
   if (state.fog.length) {
-    ensureFogSprite();
+    ensureFogSprites();
     ctx.save();
     for (const wisp of state.fog) {
-      wisp.x += wisp.vx * (0.35 + fog);
-      if (wisp.x > width + wisp.radius) wisp.x = -wisp.radius;
-      ctx.globalAlpha = (0.045 + fog * 0.05) * wisp.opacity;
-      const size = wisp.radius * 2;
-      if (fogSprite) {
-        ctx.drawImage(fogSprite, wisp.x - wisp.radius, wisp.y - wisp.radius, size, size);
+      wisp.x += wisp.vx * (0.35 + mist);
+      if (wisp.x > width + wisp.width * 0.5) wisp.x = -wisp.width;
+      ctx.globalAlpha = (0.045 + mist * 0.075) * wisp.opacity;
+      const sprite = dustFog > fog ? dustFogSprite : fogSprite;
+      if (sprite) {
+        ctx.drawImage(
+          sprite,
+          wisp.x - wisp.width * 0.5,
+          wisp.y - wisp.height * 0.5,
+          wisp.width,
+          wisp.height
+        );
       }
     }
     ctx.restore();
   }
 
   if (thunder) {
-    if (now >= state.nextFlash) {
-      state.flash = 0.55 + Math.random() * 0.4;
-      state.nextFlash = now + 1800 + Math.random() * 7000;
-    }
     if (state.flash > 0.01) {
       ctx.fillStyle = `rgba(220, 232, 255, ${state.flash * 0.42})`;
       ctx.fillRect(0, 0, width, height);

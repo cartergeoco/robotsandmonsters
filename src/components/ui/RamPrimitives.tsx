@@ -11,6 +11,7 @@ import {
 } from "react";
 import type { LucideIcon } from "lucide-react";
 import { ChevronDown, X } from "lucide-react";
+import { realHp, temporaryHp } from "../../types";
 import { RamGlyph, type RamGlyphName } from "./RamGlyph";
 import { RamOrnament } from "./RamOrnament";
 
@@ -33,34 +34,38 @@ export function RamPanel({
 
 export function RamPanelHeader({
   title,
+  subtitle,
+  leading,
   actions,
   className,
 }: {
   title: string;
+  subtitle?: ReactNode;
+  leading?: ReactNode;
   actions?: ReactNode;
   className?: string;
 }) {
   return (
     <header className={cx("ram-panel-header", className)}>
+      {leading}
       <div className="ram-panel-header__copy">
         <h2>{title}</h2>
+        {subtitle && <small>{subtitle}</small>}
       </div>
       {actions && <div className="ram-panel-header__actions">{actions}</div>}
     </header>
   );
 }
 
-export function RamPanelBody({
-  children,
-  className,
-  ...props
-}: HTMLAttributes<HTMLDivElement>) {
-  return (
-    <div className={cx("ram-panel-body", className)} {...props}>
-      {children}
-    </div>
-  );
-}
+export const RamPanelBody = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElement>>(
+  function RamPanelBody({ children, className, ...props }, ref) {
+    return (
+      <div ref={ref} className={cx("ram-panel-body", className)} {...props}>
+        {children}
+      </div>
+    );
+  }
+);
 
 export function RamSection({
   title,
@@ -242,7 +247,9 @@ export function RamCharacterCard({
   level,
   hp,
   maxHp,
+  condition,
   selected,
+  sheen,
   onClick,
 }: {
   name: string;
@@ -250,17 +257,37 @@ export function RamCharacterCard({
   level: number;
   hp: number;
   maxHp: number;
+  condition?: string | null;
   selected: boolean;
+  sheen?: { id: string; kind: "levelup" | "buff" | "debuff" } | null;
   onClick: () => void;
 }) {
-  const fraction = maxHp > 0 ? Math.max(0, Math.min(1, hp / maxHp)) : 0;
-  const tone = fraction > 0.5 ? "positive" : fraction > 0.25 ? "brass" : "danger";
+  const temp = temporaryHp(hp, maxHp);
+  const real = realHp(hp, maxHp);
+  const barMax = Math.max(maxHp, hp, 1);
+  const realFrac = real / barMax;
+  const tempFrac = temp / barMax;
+  const tone =
+    hp <= 0 ? "danger" : realFrac > 0.5 ? "positive" : realFrac > 0.25 ? "brass" : "danger";
   return (
     <button
-      className={cx("ram-character-card", selected && "is-selected")}
+      className={cx(
+        "ram-character-card",
+        selected && "is-selected",
+        sheen && "is-sheening"
+      )}
       onClick={onClick}
       aria-pressed={selected}
     >
+      {sheen && (
+        <span
+          key={sheen.id}
+          className={cx("ram-character-card__sheen", `ram-character-card__sheen--${sheen.kind}`)}
+          aria-hidden="true"
+        >
+          <span className="ram-character-card__sheen-band" />
+        </span>
+      )}
       <span className="ram-character-card__body">
         <span className="ram-character-card__heading">
           <strong>{name}</strong>
@@ -271,11 +298,19 @@ export function RamCharacterCard({
           <span className="ram-health__track">
             <span
               className={cx("ram-health__fill", `ram-health__fill--${tone}`)}
-              style={{ width: `${fraction * 100}%` }}
+              style={{ width: `${realFrac * 100}%` }}
             />
+            {tempFrac > 0 && (
+              <span
+                className="ram-health__fill ram-health__fill--temp"
+                style={{ left: `${realFrac * 100}%`, width: `${tempFrac * 100}%` }}
+              />
+            )}
           </span>
           <span className="ram-health__value">
+            {condition ? `${condition} · ` : ""}
             {hp}/{maxHp}
+            {temp > 0 ? ` +${temp}` : ""}
           </span>
         </span>
       </span>
@@ -402,12 +437,14 @@ export function RamDialog({
   children,
   onClose,
   className,
+  headerActions,
 }: {
   open: boolean;
   title: string;
   children: ReactNode;
   onClose: () => void;
   className?: string;
+  headerActions?: ReactNode;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -432,9 +469,12 @@ export function RamDialog({
         <RamPanelHeader
           title={title}
           actions={
-            <RamIconButton label="Close" onClick={onClose}>
-              <X size={16} strokeWidth={1.5} />
-            </RamIconButton>
+            <>
+              {headerActions}
+              <RamIconButton className="ram-dialog__close" label="Close" onClick={onClose}>
+                <X size={16} strokeWidth={1.5} />
+              </RamIconButton>
+            </>
           }
         />
         <div className="ram-dialog__body">{children}</div>
@@ -473,6 +513,39 @@ export function RamConfirmDialog({
           }}
         >
           {confirmLabel}
+        </RamButton>
+      </div>
+    </RamDialog>
+  );
+}
+
+export function RamUnsavedDialog({
+  open,
+  title = "Save changes?",
+  description,
+  onSave,
+  onDiscard,
+  onClose,
+}: {
+  open: boolean;
+  title?: string;
+  description: string;
+  onSave: () => void;
+  onDiscard: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <RamDialog open={open} title={title} onClose={onClose} className="confirm-dialog">
+      <p className="confirm-dialog__message">{description}</p>
+      <div className="ram-dialog__actions">
+        <RamButton variant="ghost" onClick={onDiscard}>
+          Don't save
+        </RamButton>
+        <RamButton variant="ghost" onClick={onClose}>
+          Cancel
+        </RamButton>
+        <RamButton variant="primary" onClick={onSave}>
+          Save
         </RamButton>
       </div>
     </RamDialog>
